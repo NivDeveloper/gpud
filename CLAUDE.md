@@ -61,6 +61,9 @@ src/{cuda,metal,vulkan}/   backend scaffolding — the include firewall:
   CMakeLists.txt             stub lib; comments show the PRIVATE SDK link lines
 tests/                     gtest suite + Device.h standalone-compile check
 docs/design.md             full design rationale
+docs/backend-implementation.md  the plan for implementing backends
+                           (dependency/error policy, step order,
+                           conformance suite, per-backend specifics)
 ```
 
 Backend-internal headers (src/*/[A-Z]*.h) are never installed and never
