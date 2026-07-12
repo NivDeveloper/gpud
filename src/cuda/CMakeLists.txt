@@ -5,7 +5,10 @@
 #   target_link_libraries(gpud_cuda PRIVATE CUDA::cuda_driver CUDA::nvrtc)
 # and flip GPUD_BACKEND_CUDA's default (top-level CMakeLists.txt) to
 # SDK auto-detection.
-add_library(gpud_cuda STATIC Cuda.cpp)
+add_library(gpud_cuda STATIC
+    Device.h Device.cpp     # try_open, run, context/stream teardown
+    Buffer.h Buffer.cpp     # BufferImpl + alloc/write/read
+    Kernel.h Kernel.cpp)    # KernelImpl + do_compile
 add_library(gpud::cuda ALIAS gpud_cuda)
 target_link_libraries(gpud_cuda PUBLIC gpud::gpud)
 set_target_properties(gpud_cuda PROPERTIES

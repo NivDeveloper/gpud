@@ -54,12 +54,23 @@ include/gpud/Cuda.h        cuda::try_open declaration only — never SDK types
 include/gpud/Metal.h       metal::try_open declaration only
 include/gpud/Vulkan.h      vulkan::try_open declaration only
 src/auto/open_default.cpp  env override + #ifdef GPUD_HAS_* priority chain
-src/cuda/                  backend stub (Cuda.cpp + CMakeLists) — include firewall
-src/metal/                 backend stub (Metal.cpp; becomes .mm when real)
-src/vulkan/                backend stub (Vulkan.cpp)
+src/{cuda,metal,vulkan}/   backend scaffolding — the include firewall:
+  Device.h / Device.cpp      Device subclass; try_open, run, teardown
+  Buffer.h / Buffer.cpp      BufferImpl (: Buffer::Impl) + alloc/write/read
+  Kernel.h / Kernel.cpp      KernelImpl (: Kernel::Impl) + do_compile
+  CMakeLists.txt             stub lib; comments show the PRIVATE SDK link lines
 tests/                     gtest suite + Device.h standalone-compile check
 docs/design.md             full design rationale
 ```
+
+Backend-internal headers (src/*/[A-Z]*.h) are never installed and never
+included from include/gpud/*; they are where SDK types will live. The
+public Buffer/Kernel handle classes are defined once in Device.h —
+backends implement only the Impl subclasses and the Device methods that
+produce/consume them. Every stub body calls that backend's
+`unimplemented()` (defined in its Device.h) and aborts; delete the
+helper when the last stub is gone. Metal's sources are .cpp until the
+real (Objective-C++) implementation renames them to .mm.
 
 CMake: targets `gpud` (INTERFACE, alias `gpud::gpud`), `gpud_mock`
 (INTERFACE, alias `gpud::mock`), `gpud_auto` (STATIC, alias
@@ -86,16 +97,19 @@ Device.h compiles alone under -std=c++20.
 
 ## Implementing a backend (example: vulkan)
 
-The scaffolding already exists: factory header, stub src/ dir with its
-CMakeLists, the option gate, GPUD_HAS_* plumbing, and the open_default
-arms. To implement:
+The scaffolding already exists: factory header, the src/ dir with class
+skeletons (Device subclass, BufferImpl, KernelImpl — every TODO(impl)
+marks a hole) and its CMakeLists, the option gate, GPUD_HAS_* plumbing,
+and the open_default arms. To implement:
 
-1. In `src/vulkan/`: subclass `Device`, `Buffer::Impl`, `Kernel::Impl`
-   and make `try_open` construct the device (still nullptr when no
-   driver/device/compiler). SDK headers are included ONLY here — the
-   public header must keep declaring the factory with no SDK types.
-   Keep teardown ordering, driver quirks, and compiler invocations
-   private to these files.
+1. In `src/vulkan/`: fill the TODO(impl) holes — SDK state into the
+   headers' member slots, real bodies replacing the unimplemented()
+   stubs (Device.cpp: try_open + run; Buffer.cpp: alloc/write/read;
+   Kernel.cpp: do_compile). try_open constructs the Device (still
+   nullptr when no driver/device/compiler). SDK headers are included
+   ONLY in this dir — the public header must keep declaring the factory
+   with no SDK types. Keep teardown ordering, driver quirks, and
+   compiler invocations private to these files.
 2. In `src/vulkan/CMakeLists.txt`: locate the SDK and link it PRIVATE
    (the top comment there shows the exact lines). Metal additionally
    becomes Objective-C++: Metal.cpp → Metal.mm + enable_language(OBJCXX).
