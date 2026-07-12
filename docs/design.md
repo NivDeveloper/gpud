@@ -283,4 +283,80 @@ std::unique_ptr<Device> open_default() {
   first-class handles; it is follow-up work, not part of the minimum.
 - **External synchronization only.** No internal locking, no streams;
   the ordering contract covers correctness, and either can be added
-  later without changing the interface.
+  later without changing the interface (see the synchronization note
+  below for the accepted extension shape).
+
+## Future: finer-grained synchronization (design note, accepted shape — not built)
+
+If host-visible sync ever gets added, it is a **device timeline**
+(tickets), not semaphore objects.
+
+**The cross-backend primitive is the timeline** — a monotonically
+increasing 64-bit counter that work signals and anyone can wait on or
+poll. Every backend has converged on it:
+
+| Backend | timeline primitive                                | host wait                | poll                           |
+|---------|---------------------------------------------------|--------------------------|--------------------------------|
+| Vulkan  | timeline `VkSemaphore` (core 1.2, already required) | `vkWaitSemaphores`     | `vkGetSemaphoreCounterValue`   |
+| Metal   | `MTLSharedEvent` (value-based signal/wait)        | `waitUntilSignaledValue` | `.signaledValue`               |
+| CUDA    | in-order stream + `cuEvent` per value             | `cuEventSynchronize`     | `cuEventQuery`                 |
+| Mock    | a counter                                         | no-op                    | `==`                           |
+
+Vulkan's binary semaphores and fences are the legacy shapes; timelines
+were introduced precisely because the counter model matches D3D12
+fences, `MTLSharedEvent`, and CUDA's stream/event model.
+
+**Why tickets and not semaphore objects.** A gpud Device is one
+in-order execution context (one queue/stream), so ordering within a
+device is already total — GPU→GPU semaphores between its own commands
+add nothing. The only thing fine-grained sync buys here is letting the
+host observe and wait on *positions in that order* without the big
+hammer of `read()`. That needs no new handle type:
+
+```cpp
+class Device {
+    // ... the five ops, unchanged ...
+
+    // The device timeline: every run() (and, with batching, every
+    // enqueued write/read) occupies one tick, in call order.
+    virtual std::uint64_t submitted() const;   // ticket of last enqueued work
+    virtual std::uint64_t completed() const;   // highest finished ticket (poll)
+    virtual void wait(std::uint64_t ticket);   // block host until ticket done
+};
+```
+
+Tickets *refine* the ordering contract rather than replacing it:
+`read()` keeps its exact meaning and becomes, internally, "wait(last
+ticket touching this buffer) + copy". No new move-only handle with
+lifetime rules, no wait/signal lists on run(), and values are never
+reused, so the scheme is race-free by construction (the same property
+that makes timelines strictly better than binary semaphores).
+
+Rejected: explicit Signal/Fence objects with wait/signal lists on
+run() (the VkSubmitInfo shape). More expressive — arbitrary DAGs,
+cross-device edges — but on a single in-order queue a DAG degenerates
+to submission order, so the ceremony buys nothing until gpud exposes
+multiple queues, which it deliberately doesn't. If queue-level
+parallelism ever matters, the design-consistent move is *open two
+Devices*; the ticket model then extends with one primitive
+(`wait_on(other_device, ticket)`). Cross-*backend* waits (Vulkan →
+Metal) would require OS-level external semaphores and are out of
+scope; host-side `wait` + `write` already bridges devices correctly.
+
+Sequencing and contract notes, for whoever builds this:
+
+- **Land it with (or after) batching, not before.** Under v1's blocking
+  run() every ticket is complete before run() returns — the API would
+  be dead weight. Batching and tickets are the same feature seen from
+  inside and outside: the submission counter batching needs internally
+  is exactly what `submitted()` exposes.
+- **The real contract change is threading, not the primitive.**
+  wait()/completed() are only useful from another thread; v1 says
+  calls on one Device are externally synchronized. All three backends
+  support host wait/poll from any thread, so the carve-out ("wait and
+  completed are thread-safe; everything else stays externally
+  synchronized") is cheap — but must be explicit in Device.h.
+- **Interop-grade sync** (handing a semaphore to a renderer — external
+  semaphore handles, `MTLSharedEvent` export, `cuImportExternalSemaphore`)
+  is the one case that would need an exported opaque handle. Separate,
+  later decision; nothing in the ticket model forecloses it.
