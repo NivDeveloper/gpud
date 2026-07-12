@@ -102,6 +102,21 @@ builds its stub lib, defines GPUD_HAS_<backend> on gpud_auto, and links
 it into the open_default() chain — where its try_open, returning
 nullptr, fails over to the next backend.
 
+## Releasing
+
+Versioning is SemVer on annotated git tags; consumers (e.g. the tensor
+repo) pin `GIT_TAG vX.Y.Z` in FetchContent, so releasing is what makes
+a change reachable. Pre-1.0 policy: MINOR may break the interface,
+PATCH never does. The version lives in exactly one place —
+`project(gpud VERSION X.Y.Z)` — and `<gpud/Version.h>` is generated
+from it (never edit or commit a generated Version.h). To release:
+
+1. Bump `project(gpud VERSION X.Y.Z)` in CMakeLists.txt.
+2. Commit, then `git tag -a vX.Y.Z -m "<one-line summary>"`.
+3. `git push --follow-tags`.
+
+The tag and project() version must always match.
+
 ## Build / test
 
 ```

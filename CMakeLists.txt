@@ -27,11 +27,17 @@ option(GPUD_BACKEND_METAL "Build the Metal backend" OFF)
 option(GPUD_BACKEND_CUDA "Build the CUDA backend" OFF)
 
 # ── core: the dependency-free interface ─────────────────────────────────
+# <gpud/Version.h> is generated into the build tree from the project
+# version above — bumping the version means editing project() only.
+configure_file(include/gpud/Version.h.in
+    ${CMAKE_CURRENT_BINARY_DIR}/include/gpud/Version.h @ONLY)
+
 add_library(gpud INTERFACE)
 add_library(gpud::gpud ALIAS gpud)
 target_compile_features(gpud INTERFACE cxx_std_20)
 target_include_directories(gpud INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 
 # ── mock backend (header-only: include/gpud/Mock.h) ─────────────────────

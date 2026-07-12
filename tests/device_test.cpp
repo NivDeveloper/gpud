@@ -4,8 +4,12 @@
 #include <gpud/Auto.h>
 #include <gpud/Device.h>
 #include <gpud/Mock.h>
+#include <gpud/Version.h>
 
 #include <gtest/gtest.h>
+
+static_assert(GPUD_VERSION_MAJOR >= 0 && sizeof(gpud::version) > 1,
+              "generated Version.h is coherent");
 
 #include <array>
 #include <cstdlib>

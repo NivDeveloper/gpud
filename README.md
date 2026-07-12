@@ -33,11 +33,18 @@ on PATH; without them `try_open()`/`open_default()` just return null
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(gpud GIT_REPOSITORY https://github.com/NivDeveloper/gpud GIT_TAG main)
+FetchContent_Declare(gpud
+  GIT_REPOSITORY https://github.com/NivDeveloper/gpud
+  GIT_TAG v0.1.0)   # ← pin a release; bump this line to update
 FetchContent_MakeAvailable(gpud)
 
 target_link_libraries(app PRIVATE gpud::auto_)   # underscore: `auto` is a keyword
 ```
+
+Versioning is [SemVer](https://semver.org) via git tags; pre-1.0, a
+minor bump may break the interface, a patch bump never does.
+`<gpud/Version.h>` (generated) carries `GPUD_VERSION_*` for
+compile-time checks.
 
 Only the application picks a backend (`gpud::auto_` or a specific one,
 e.g. `gpud::vulkan`). Libraries just take a `gpud::Device&` and link

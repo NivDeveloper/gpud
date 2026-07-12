@@ -1,0 +1,17 @@
+#pragma once
+
+// Generated from Version.h.in by CMake — do not edit, do not commit.
+// The single source of truth is project(gpud VERSION …) in the
+// top-level CMakeLists.txt, which the release tag mirrors (CLAUDE.md
+// "Releasing"). Opt-in: no other gpud header includes this.
+
+// clang-format off
+#define GPUD_VERSION_MAJOR @PROJECT_VERSION_MAJOR@
+#define GPUD_VERSION_MINOR @PROJECT_VERSION_MINOR@
+#define GPUD_VERSION_PATCH @PROJECT_VERSION_PATCH@
+#define GPUD_VERSION "@PROJECT_VERSION@"
+// clang-format on
+
+namespace gpud {
+inline constexpr char version[] = GPUD_VERSION;
+} // namespace gpud
