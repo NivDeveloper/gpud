@@ -4,9 +4,12 @@ A minimal GPU compute abstraction: five operations behind one virtual
 interface, backends as separately compiled libraries, no global state.
 
 `gpud` is a working name. Current status: the interface, a header-only
-mock backend, and the auto-selection skeleton. No real GPU backend is
-implemented yet. Full rationale in [docs/design.md](docs/design.md);
-conventions and how to add a backend in [CLAUDE.md](CLAUDE.md).
+mock backend, the auto-selection skeleton, and scaffolding stubs for
+the CUDA/Metal/Vulkan backends (factory headers + stub libraries whose
+`try_open` returns nullptr; no SDK is included or linked). No real GPU
+backend is implemented yet. Full rationale in
+[docs/design.md](docs/design.md); conventions and how to implement a
+backend in [CLAUDE.md](CLAUDE.md).
 
 ## The interface
 
@@ -69,4 +72,6 @@ googletest).
 
 CMake targets: `gpud::gpud` (the interface, INTERFACE), `gpud::mock`
 (header-only mock backend), `gpud::auto_` (compiled auto-selection —
-trailing underscore because plain `auto` is a C++ keyword).
+trailing underscore because plain `auto` is a C++ keyword), and, behind
+the `GPUD_BACKEND_{CUDA,METAL,VULKAN}` options (default OFF while they
+are stubs), `gpud::cuda` / `gpud::metal` / `gpud::vulkan`.

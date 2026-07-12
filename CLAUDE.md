@@ -4,7 +4,9 @@ Minimal GPU compute abstraction. Namespace `gpud`; plain C++20
 (std::span is the floor — no C++23/26, no reflection); must build with
 the system default compiler (AppleClang). Design rationale:
 docs/design.md. Current state: interface + header-only mock backend +
-auto-selection skeleton; no real GPU backend exists yet.
+auto-selection skeleton + scaffolding stubs for the cuda/metal/vulkan
+backends (their try_open always returns nullptr; no SDK is included,
+located, or linked anywhere). No real GPU backend is implemented yet.
 
 ## Invariants (do not break)
 
@@ -48,17 +50,27 @@ auto-selection skeleton; no real GPU backend exists yet.
 include/gpud/Device.h      the whole abstract interface + Options; std-only
 include/gpud/Mock.h        header-only mock (gpud::mock::Device, try_open)
 include/gpud/Auto.h        open_default() declaration
+include/gpud/Cuda.h        cuda::try_open declaration only — never SDK types
+include/gpud/Metal.h       metal::try_open declaration only
+include/gpud/Vulkan.h      vulkan::try_open declaration only
 src/auto/open_default.cpp  env override + #ifdef GPUD_HAS_* priority chain
+src/cuda/                  backend stub (Cuda.cpp + CMakeLists) — include firewall
+src/metal/                 backend stub (Metal.cpp; becomes .mm when real)
+src/vulkan/                backend stub (Vulkan.cpp)
 tests/                     gtest suite + Device.h standalone-compile check
 docs/design.md             full design rationale
 ```
 
 CMake: targets `gpud` (INTERFACE, alias `gpud::gpud`), `gpud_mock`
 (INTERFACE, alias `gpud::mock`), `gpud_auto` (STATIC, alias
-`gpud::auto_`). Options: `GPUD_BUILD_TESTS` (default ON at top level),
+`gpud::auto_`), and per-backend static libs `gpud_cuda`/`gpud_metal`/
+`gpud_vulkan` (aliases `gpud::cuda` etc.), each gated on its option.
+Options: `GPUD_BUILD_TESTS` (default ON at top level),
 `GPUD_BACKEND_{VULKAN,METAL,CUDA}` (intended default: SDK auto-detect;
-hard OFF until the backends exist — today they only feed GPUD_HAS_*
-into gpud_auto).
+hard OFF while the backends are stubs). Turning a backend option ON
+builds its stub lib, defines GPUD_HAS_<backend> on gpud_auto, and links
+it into the open_default() chain — where its try_open, returning
+nullptr, fails over to the next backend.
 
 ## Build / test
 
@@ -72,26 +84,32 @@ Tests fetch googletest via FetchContent (needs network on first
 configure). tests/device_h_standalone.cpp is a build-time check that
 Device.h compiles alone under -std=c++20.
 
-## Adding a backend (example: vulkan)
+## Implementing a backend (example: vulkan)
 
-1. `include/gpud/Vulkan.h` — factory declaration ONLY, no SDK types:
-   `namespace gpud::vulkan { std::unique_ptr<Device> try_open(const Options& = {}); }`
-2. `src/vulkan/*.cpp` — subclass `Device`, `Buffer::Impl`,
-   `Kernel::Impl`; keep teardown ordering, driver quirks, and compiler
-   invocations private to these files.
-3. CMake: `add_subdirectory(src/vulkan)` gated on `GPUD_BACKEND_VULKAN`
-   (flip that option's default to SDK detection, e.g.
-   `find_package(Vulkan QUIET)`); define target `gpud_vulkan` + alias
-   `gpud::vulkan`, linking the SDK PRIVATE and `gpud::gpud` PUBLIC.
-4. Wire gpud_auto: in the existing `if(GPUD_BACKEND_VULKAN)` block add
-   `target_link_libraries(gpud_auto PRIVATE gpud::vulkan)` (the
-   GPUD_HAS_VULKAN define is already plumbed); in
-   src/auto/open_default.cpp the `#ifdef GPUD_HAS_VULKAN` arms already
-   exist for new backends' pattern — one include + one arm in the env
-   chain + one arm in the priority chain. Keep priority native-first:
-   CUDA, Metal, Vulkan.
-5. `dialect()` returns the kernel-source dialect the backend consumes
+The scaffolding already exists: factory header, stub src/ dir with its
+CMakeLists, the option gate, GPUD_HAS_* plumbing, and the open_default
+arms. To implement:
+
+1. In `src/vulkan/`: subclass `Device`, `Buffer::Impl`, `Kernel::Impl`
+   and make `try_open` construct the device (still nullptr when no
+   driver/device/compiler). SDK headers are included ONLY here — the
+   public header must keep declaring the factory with no SDK types.
+   Keep teardown ordering, driver quirks, and compiler invocations
+   private to these files.
+2. In `src/vulkan/CMakeLists.txt`: locate the SDK and link it PRIVATE
+   (the top comment there shows the exact lines). Metal additionally
+   becomes Objective-C++: Metal.cpp → Metal.mm + enable_language(OBJCXX).
+3. In the top-level CMakeLists.txt: flip GPUD_BACKEND_VULKAN's default
+   from OFF to SDK auto-detection (find_package(Vulkan QUIET) →
+   ${Vulkan_FOUND}; Metal → ${APPLE}; CUDA → find_package(CUDAToolkit)).
+4. `dialect()` returns the kernel-source dialect the backend consumes
    ("slang-vulkan", "metal", "cuda"). Resist adding introspection
    beyond that string.
-6. Tests against real hardware must skip cleanly when
+5. Tests against real hardware must skip cleanly when
    `try_open() == nullptr` (no driver/device on the machine or CI).
+
+Adding a *fourth* backend = replicate the scaffolding: factory header,
+src/<backend>/ stub + CMakeLists, one gated block in the top-level
+CMakeLists, one #ifdef GPUD_HAS_* include + env arm + priority-chain
+arm in src/auto/open_default.cpp (priority stays native-first: CUDA,
+Metal, Vulkan).

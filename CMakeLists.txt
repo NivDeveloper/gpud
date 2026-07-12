@@ -4,9 +4,10 @@ project(gpud VERSION 0.1.0 LANGUAGES CXX
 
 option(GPUD_BUILD_TESTS "Build gpud tests" ${PROJECT_IS_TOP_LEVEL})
 
-# Per-backend options. The intended default is SDK auto-detection, but no
-# backend is implemented yet, so every default resolves to OFF. When a
-# backend lands, switch its default to detection:
+# Per-backend options. The intended default is SDK auto-detection, but
+# the backends are scaffolding stubs (try_open always returns nullptr,
+# no SDK located or linked), so every default stays OFF. When a real
+# implementation lands, switch its default to detection:
 #   Vulkan:  find_package(Vulkan QUIET)       -> default ${Vulkan_FOUND}
 #   Metal:   Apple platforms                  -> default ${APPLE}
 #   CUDA:    find_package(CUDAToolkit QUIET)  -> default ${CUDAToolkit_FOUND}
@@ -29,14 +30,6 @@ add_library(gpud_mock INTERFACE)
 add_library(gpud::mock ALIAS gpud_mock)
 target_link_libraries(gpud_mock INTERFACE gpud)
 
-# ── real backends hook in here when they land ───────────────────────────
-# Each is a separately compiled static library linking its SDK PRIVATE,
-# added inside its option gate, e.g.:
-#   if(GPUD_BACKEND_VULKAN)
-#     add_subdirectory(src/vulkan)   # defines gpud_vulkan + alias gpud::vulkan
-#   endif()
-# (src/vulkan, src/metal, src/cuda do not exist yet — nothing to add.)
-
 # ── auto-selection: gpud_auto (alias gpud::auto_; `auto` is a C++ keyword) ─
 add_library(gpud_auto STATIC src/auto/open_default.cpp)
 add_library(gpud::auto_ ALIAS gpud_auto)
@@ -45,18 +38,26 @@ set_target_properties(gpud_auto PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 target_compile_options(gpud_auto PRIVATE -Wall -Wextra)
 
-# Backend availability is baked into gpud_auto at its build time via the
-# GPUD_HAS_* defines (PUBLIC so application code can compile conditionally
-# on them too). When a backend lands, its block also links the backend
-# library, e.g. target_link_libraries(gpud_auto PRIVATE gpud::cuda).
+# ── real backends (scaffolding: stub try_open, no SDK located/linked) ───
+# One block per backend, in auto-selection priority order. Each is a
+# separately compiled static library that links its SDK PRIVATE inside
+# its own directory. Availability is baked into gpud_auto at its build
+# time via the GPUD_HAS_* defines (PUBLIC so application code can
+# compile conditionally on them too).
 if(GPUD_BACKEND_CUDA)
+  add_subdirectory(src/cuda)     # gpud_cuda + alias gpud::cuda
   target_compile_definitions(gpud_auto PUBLIC GPUD_HAS_CUDA)
+  target_link_libraries(gpud_auto PRIVATE gpud::cuda)
 endif()
 if(GPUD_BACKEND_METAL)
+  add_subdirectory(src/metal)    # gpud_metal + alias gpud::metal
   target_compile_definitions(gpud_auto PUBLIC GPUD_HAS_METAL)
+  target_link_libraries(gpud_auto PRIVATE gpud::metal)
 endif()
 if(GPUD_BACKEND_VULKAN)
+  add_subdirectory(src/vulkan)   # gpud_vulkan + alias gpud::vulkan
   target_compile_definitions(gpud_auto PUBLIC GPUD_HAS_VULKAN)
+  target_link_libraries(gpud_auto PRIVATE gpud::vulkan)
 endif()
 
 if(GPUD_BUILD_TESTS)

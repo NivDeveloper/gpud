@@ -157,14 +157,15 @@ gpud/
   include/gpud/Device.h     the interface — no deps beyond std (INTERFACE target)
   include/gpud/Mock.h       mock backend, header-only — consumers' tests need no SDK
   include/gpud/Auto.h  + src/auto/*.cpp       open_default() — see below
-  include/gpud/Vulkan.h + src/vulkan/*.cpp    (future) factory decl only / links Vulkan PRIVATE
-  include/gpud/Metal.h  + src/metal/*.mm      (future, APPLE only)
-  include/gpud/Cuda.h   + src/cuda/*.cpp      (future, CUDA toolkit present only)
+  include/gpud/Vulkan.h + src/vulkan/*.cpp    factory decl only / links Vulkan PRIVATE (stub today)
+  include/gpud/Metal.h  + src/metal/*.mm      APPLE only (stub today, .cpp until real)
+  include/gpud/Cuda.h   + src/cuda/*.cpp      CUDA toolkit present only (stub today)
 ```
 
 CMake targets: `gpud::gpud` (interface), `gpud::mock`, `gpud::auto_`,
-and later `gpud::vulkan` / `gpud::metal` / `gpud::cuda`. Each real
-backend is gated on an option + SDK auto-detection
+and `gpud::vulkan` / `gpud::metal` / `gpud::cuda` (scaffolding stubs
+until implemented). Each real backend is gated on an option + SDK
+auto-detection
 (`find_package(Vulkan)`, `if(APPLE)`, `find_package(CUDAToolkit)`);
 what can't be built is simply absent, and exported `GPUD_HAS_*` defines
 let application code compile conditionally.
