@@ -32,6 +32,12 @@
 //     is no library-wide init or shutdown. Handles (Buffer, Kernel) must
 //     not outlive the Device that created them, and must only be passed
 //     back to that same Device.
+//
+//  5. Errors. Backend factories (gpud::<backend>::try_open) never throw:
+//     they return nullptr when the backend can't come up, for any reason
+//     (set GPUD_LOG=1 for a stderr line saying why). Once a Device is
+//     open, failed operations throw std::runtime_error — kernel compile
+//     errors carry the compiler diagnostics verbatim.
 
 #include <cstddef>
 #include <memory>
@@ -138,6 +144,11 @@ class Device {
 
   protected:
     virtual Kernel do_compile(std::string_view source) = 0;
+
+    // Base members are destroyed only after the derived destructor has
+    // run — a backend whose Kernel impls reference device state must
+    // clear the memoization cache before tearing that state down.
+    void clear_kernels() { kernels_.clear(); }
 
   private:
     std::unordered_map<const void *, Kernel> kernels_;

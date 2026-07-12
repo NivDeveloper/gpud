@@ -1,34 +1,50 @@
 #pragma once
 
-// Internal to src/vulkan — inside the include firewall. Never
-// installed, never included from include/gpud/*. SDK headers
-// (<vulkan/vulkan.h>, slang, …) may appear here and in siblings, but
-// nowhere reachable from the public headers.
+// Internal to src/vulkan — inside the include firewall. Never installed,
+// never included from include/gpud/*.
 //
-// STATUS: scaffolding — every method is an unimplemented stub and
-// try_open() returns nullptr, so none of this can execute yet.
+// volk resolves every Vulkan function at runtime (no loader is linked);
+// a machine without a driver fails in try_open, not at build or load
+// time. Function pointers are process-global (volkLoadDevice), which
+// assumes all coexisting vulkan Devices go through the same driver —
+// fine until someone runs two different ICDs in one process.
 
 #include <gpud/Device.h>
 
-#include <cstdio>
-#include <cstdlib>
+#include <volk.h>
+
+#include <stdexcept>
+#include <string>
 
 namespace gpud::vulkan {
 
-// Scaffolding marker: every stub body calls this. Delete it once the
-// last stub is implemented.
-[[noreturn]] inline void unimplemented(const char *what) {
-    std::fprintf(stderr, "gpud/vulkan: %s is not implemented\n", what);
-    std::abort();
+// Error contract: failures after a successful try_open throw.
+inline void check(VkResult r, const char *what) {
+    if (r != VK_SUCCESS)
+        throw std::runtime_error(std::string("gpud/vulkan: ") + what +
+                                 " failed (VkResult " + std::to_string(r) +
+                                 ")");
 }
 
 class Device final : public ::gpud::Device {
   public:
-    // TODO(impl): construct from the state try_open() brings up
-    // (instance, physical + logical device picked per Options, compute
-    // queue, command pool); the destructor tears down in reverse order
-    // — teardown ordering and driver quirks stay in Device.cpp.
-    Device() = default;
+    // Everything try_open() brought up, owned (and torn down, in
+    // reverse) by the Device.
+    struct State {
+        VkInstance instance{};
+        VkPhysicalDevice phys{};
+        VkDevice device{};
+        VkQueue queue{};
+        std::uint32_t queue_family{};
+        VkCommandPool pool{};
+        VkCommandBuffer cmd{};   // one reusable buffer: run() is blocking (v1)
+        VkFence fence{};
+        VkPhysicalDeviceMemoryProperties memory{};
+        std::string slangc;      // resolved compiler path
+    };
+
+    explicit Device(const State &state) : s(state) {}
+    ~Device() override;
 
     std::string_view dialect() const override { return "slang-vulkan"; }
 
@@ -47,9 +63,7 @@ class Device final : public ::gpud::Device {
     Kernel do_compile(std::string_view source) override;
 
   private:
-    // TODO(impl): VkInstance / VkPhysicalDevice / VkDevice / VkQueue /
-    // command pool, plus pending-submission batch state (the ordering
-    // contract allows batching runs and syncing only at read()).
+    State s;
 };
 
 } // namespace gpud::vulkan

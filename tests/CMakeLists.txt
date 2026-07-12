@@ -16,8 +16,13 @@ set_target_properties(gpud_device_h_standalone PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 target_compile_options(gpud_device_h_standalone PRIVATE -Wall -Wextra)
 
-add_executable(gpud_tests device_test.cpp)
+add_executable(gpud_tests device_test.cpp conformance_test.cpp)
 target_link_libraries(gpud_tests PRIVATE gpud::mock gpud::auto_ GTest::gtest_main)
+# The conformance suite calls backend factories directly (gpud_auto only
+# links them PRIVATE); GPUD_HAS_* defines arrive via gpud::auto_.
+if(GPUD_BACKEND_VULKAN)
+  target_link_libraries(gpud_tests PRIVATE gpud::vulkan)
+endif()
 set_target_properties(gpud_tests PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 target_compile_options(gpud_tests PRIVATE -Wall -Wextra)

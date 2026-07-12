@@ -1,28 +1,237 @@
-// try_open (device bring-up), run (dispatch), and — once implemented —
-// destruction/teardown ordering and driver workarounds.
+// try_open (all runtime probing lives here), run, and teardown.
+//
+// macOS note: there is deliberately nothing MoltenVK-specific in this
+// backend. The two portability touches below (instance enumeration
+// flag, portability_subset device extension) are the generic Khronos
+// pattern for any portability driver, driven by runtime extension
+// queries — no platform #ifdefs.
 
+#include "Buffer.h"
 #include "Device.h"
+#include "Kernel.h"
 
 #include <gpud/Vulkan.h>
 
-namespace gpud::vulkan {
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 
-std::unique_ptr<::gpud::Device> try_open(const Options &) {
-    // TODO(impl): create instance, enumerate physical devices, pick by
-    // Options::device_index (-1 = the obvious one), bring up logical
-    // device + compute queue; nullptr on any failure (no driver, no
-    // device, no kernel compiler). Until then: unimplemented, so
-    // callers and auto-selection fail over.
-    return nullptr;
+namespace gpud::vulkan {
+namespace {
+
+void log(const char *msg) {
+    static const bool on = std::getenv("GPUD_LOG") != nullptr;
+    if (on) std::fprintf(stderr, "gpud/vulkan: try_open: %s\n", msg);
 }
 
-void Device::run(const Kernel &, std::size_t, std::span<const std::byte>,
-                 std::span<Buffer *const>) {
-    // TODO(impl): bind the kernel's pipeline and push `scalars`
-    // followed by each buffer's device address (BDA), positional;
-    // dispatch `groups` workgroups. Free to batch submissions —
-    // read() is the sync point.
-    unimplemented("Device::run");
+// std::system's shell may not have /usr/local/bin or /opt/homebrew/bin
+// on PATH — probe the common install locations (vklib-proven).
+std::string find_slangc() {
+    for (const char *c :
+         {"/usr/local/bin/slangc", "/opt/homebrew/bin/slangc", "slangc"}) {
+        const std::string probe = std::string(c) + " -h > /dev/null 2>&1";
+        if (std::system(probe.c_str()) == 0) return c;
+    }
+    return {};
+}
+
+bool has_extension(const std::vector<VkExtensionProperties> &exts,
+                   const char *name) {
+    for (const auto &e : exts)
+        if (std::strcmp(e.extensionName, name) == 0) return true;
+    return false;
+}
+
+} // namespace
+
+std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
+    Device::State s;
+
+    s.slangc = find_slangc();
+    if (s.slangc.empty()) return log("no slangc"), nullptr;
+
+    if (volkInitialize() != VK_SUCCESS)
+        return log("no Vulkan loader"), nullptr;
+
+    // Instance. Enable portability enumeration iff the loader offers it
+    // (required to see portability drivers like MoltenVK; absent = no-op).
+    std::uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> inst_ext_props(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, inst_ext_props.data());
+
+    std::vector<const char *> inst_exts;
+    VkInstanceCreateFlags flags = 0;
+    if (has_extension(inst_ext_props, "VK_KHR_portability_enumeration")) {
+        inst_exts.push_back("VK_KHR_portability_enumeration");
+        flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    }
+
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "gpud";
+    app.apiVersion = VK_API_VERSION_1_2;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.flags = flags;
+    ici.pApplicationInfo = &app;
+    ici.enabledExtensionCount = std::uint32_t(inst_exts.size());
+    ici.ppEnabledExtensionNames = inst_exts.data();
+    if (vkCreateInstance(&ici, nullptr, &s.instance) != VK_SUCCESS)
+        return log("vkCreateInstance failed"), nullptr;
+    volkLoadInstance(s.instance);
+
+    const auto fail = [&](const char *why) {
+        log(why);
+        if (s.device) vkDestroyDevice(s.device, nullptr);
+        vkDestroyInstance(s.instance, nullptr);
+        return nullptr;
+    };
+
+    // Physical device: Options::device_index, or -1 = first discrete
+    // GPU, else the first device.
+    n = 0;
+    vkEnumeratePhysicalDevices(s.instance, &n, nullptr);
+    if (n == 0) return fail("no devices");
+    std::vector<VkPhysicalDevice> devs(n);
+    vkEnumeratePhysicalDevices(s.instance, &n, devs.data());
+    if (opts.device_index >= 0) {
+        if (std::uint32_t(opts.device_index) >= n)
+            return fail("device_index out of range");
+        s.phys = devs[std::uint32_t(opts.device_index)];
+    } else {
+        s.phys = devs[0];
+        for (auto d : devs) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(d, &p);
+            if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
+                s.phys = d;
+                break;
+            }
+        }
+    }
+
+    // The BDA push-constant ABI needs Vulkan 1.2 + bufferDeviceAddress;
+    // no descriptor-set fallback path — nullptr instead.
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(s.phys, &props);
+    if (props.apiVersion < VK_API_VERSION_1_2)
+        return fail("device below Vulkan 1.2");
+    VkPhysicalDeviceVulkan12Features f12{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &f12;
+    vkGetPhysicalDeviceFeatures2(s.phys, &f2);
+    if (!f12.bufferDeviceAddress) return fail("no bufferDeviceAddress");
+
+    n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &n, nullptr);
+    std::vector<VkQueueFamilyProperties> families(n);
+    vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &n, families.data());
+    s.queue_family = n;
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+            s.queue_family = i;
+            break;
+        }
+    if (s.queue_family == n) return fail("no compute queue");
+
+    // Logical device. The spec requires enabling portability_subset
+    // whenever the device advertises it.
+    n = 0;
+    vkEnumerateDeviceExtensionProperties(s.phys, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> dev_ext_props(n);
+    vkEnumerateDeviceExtensionProperties(s.phys, nullptr, &n,
+                                         dev_ext_props.data());
+    std::vector<const char *> dev_exts;
+    if (has_extension(dev_ext_props, "VK_KHR_portability_subset"))
+        dev_exts.push_back("VK_KHR_portability_subset");
+
+    const float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    qci.queueFamilyIndex = s.queue_family;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+    VkPhysicalDeviceVulkan12Features enable12{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    enable12.bufferDeviceAddress = VK_TRUE;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.pNext = &enable12;
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = std::uint32_t(dev_exts.size());
+    dci.ppEnabledExtensionNames = dev_exts.data();
+    if (vkCreateDevice(s.phys, &dci, nullptr, &s.device) != VK_SUCCESS)
+        return fail("vkCreateDevice failed");
+    volkLoadDevice(s.device);
+    vkGetDeviceQueue(s.device, s.queue_family, 0, &s.queue);
+    vkGetPhysicalDeviceMemoryProperties(s.phys, &s.memory);
+
+    // One reusable command buffer + fence — run() submits and blocks (v1).
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = s.queue_family;
+    if (vkCreateCommandPool(s.device, &pci, nullptr, &s.pool) != VK_SUCCESS)
+        return fail("vkCreateCommandPool failed");
+    VkCommandBufferAllocateInfo cai{
+        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = s.pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    vkAllocateCommandBuffers(s.device, &cai, &s.cmd);
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(s.device, &fci, nullptr, &s.fence) != VK_SUCCESS) {
+        vkDestroyCommandPool(s.device, s.pool, nullptr);
+        return fail("vkCreateFence failed");
+    }
+
+    return std::make_unique<Device>(s);
+}
+
+Device::~Device() {
+    vkDeviceWaitIdle(s.device);
+    clear_kernels();   // KernelImpls hold pipelines — before the VkDevice
+    vkDestroyFence(s.device, s.fence, nullptr);
+    vkDestroyCommandPool(s.device, s.pool, nullptr);
+    vkDestroyDevice(s.device, nullptr);
+    vkDestroyInstance(s.instance, nullptr);
+}
+
+void Device::run(const Kernel &kernel, std::size_t groups,
+                 std::span<const std::byte> scalars,
+                 std::span<Buffer *const> buffers) {
+    const auto *k = static_cast<const KernelImpl *>(kernel.impl());
+
+    // Push data = the scalar blob, then each buffer's device address at
+    // the next 8-aligned offset — matching the dialect's PC struct
+    // layout (scalars first, then pointer members).
+    std::byte push[128] = {};
+    const std::size_t addr_off = (scalars.size() + 7) & ~std::size_t{7};
+    if (addr_off + 8 * buffers.size() > sizeof push)
+        throw std::runtime_error("gpud/vulkan: push data exceeds 128 bytes");
+    if (!scalars.empty())
+        std::memcpy(push, scalars.data(), scalars.size());
+    for (std::size_t i = 0; i < buffers.size(); ++i)
+        std::memcpy(push + addr_off + 8 * i, &impl_of(*buffers[i]).address, 8);
+
+    // Record + submit + wait. The per-run fence wait is what makes the
+    // ordering contract trivially hold; batching with sync-at-read() is
+    // the planned optimization and only touches this file.
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(s.cmd, &bi), "vkBeginCommandBuffer");
+    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
+    vkCmdPushConstants(s.cmd, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                       sizeof push, push);
+    vkCmdDispatch(s.cmd, std::uint32_t(groups), 1, 1);
+    check(vkEndCommandBuffer(s.cmd), "vkEndCommandBuffer");
+
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &s.cmd;
+    check(vkQueueSubmit(s.queue, 1, &si, s.fence), "vkQueueSubmit");
+    check(vkWaitForFences(s.device, 1, &s.fence, VK_TRUE, UINT64_MAX),
+          "vkWaitForFences");
+    check(vkResetFences(s.device, 1, &s.fence), "vkResetFences");
 }
 
 } // namespace gpud::vulkan

@@ -4,14 +4,25 @@ project(gpud VERSION 0.1.0 LANGUAGES CXX
 
 option(GPUD_BUILD_TESTS "Build gpud tests" ${PROJECT_IS_TOP_LEVEL})
 
-# Per-backend options. The intended default is SDK auto-detection, but
-# the backends are scaffolding stubs (try_open always returns nullptr,
-# no SDK located or linked), so every default stays OFF. When a real
-# implementation lands, switch its default to detection:
-#   Vulkan:  find_package(Vulkan QUIET)       -> default ${Vulkan_FOUND}
+# Per-backend options.
+#
+# Vulkan is implemented; it defaults ON where Vulkan development files
+# already exist and can be forced ON anywhere — building needs no
+# preinstalled SDK (headers and volk are fetched; the driver is probed
+# at runtime by try_open).
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+  set(GPUD_VULKAN_DEFAULT ON)
+else()
+  set(GPUD_VULKAN_DEFAULT OFF)
+endif()
+option(GPUD_BACKEND_VULKAN "Build the Vulkan backend" ${GPUD_VULKAN_DEFAULT})
+
+# Metal and CUDA are scaffolding stubs (try_open always returns
+# nullptr), so their defaults stay OFF. When a real implementation
+# lands, switch to detection:
 #   Metal:   Apple platforms                  -> default ${APPLE}
 #   CUDA:    find_package(CUDAToolkit QUIET)  -> default ${CUDAToolkit_FOUND}
-option(GPUD_BACKEND_VULKAN "Build the Vulkan backend" OFF)
 option(GPUD_BACKEND_METAL "Build the Metal backend" OFF)
 option(GPUD_BACKEND_CUDA "Build the CUDA backend" OFF)
 

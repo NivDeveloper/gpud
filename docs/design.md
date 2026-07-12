@@ -157,7 +157,7 @@ gpud/
   include/gpud/Device.h     the interface — no deps beyond std (INTERFACE target)
   include/gpud/Mock.h       mock backend, header-only — consumers' tests need no SDK
   include/gpud/Auto.h  + src/auto/*.cpp       open_default() — see below
-  include/gpud/Vulkan.h + src/vulkan/*.cpp    factory decl only / links Vulkan PRIVATE (stub today)
+  include/gpud/Vulkan.h + src/vulkan/*.cpp    factory decl only / implemented: volk + fetched headers, no SDK linked
   include/gpud/Metal.h  + src/metal/*.mm      APPLE only (stub today, .cpp until real)
   include/gpud/Cuda.h   + src/cuda/*.cpp      CUDA toolkit present only (stub today)
 ```

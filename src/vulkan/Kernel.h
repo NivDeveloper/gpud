@@ -5,11 +5,21 @@
 
 #include <gpud/Device.h>
 
+#include <volk.h>
+
 namespace gpud::vulkan {
 
 struct KernelImpl final : ::gpud::Kernel::Impl {
-    // TODO(impl): VkShaderModule, VkPipelineLayout (one push-constant
-    // range: scalars then buffer device addresses), VkPipeline.
+    VkDevice device{};   // non-owning, for destruction
+    VkPipelineLayout layout{};
+    VkPipeline pipeline{};
+
+    ~KernelImpl() override {
+        // Cached impls live in the base-class kernel map; ~Device calls
+        // clear_kernels() before destroying the VkDevice.
+        if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+        if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    }
 };
 
 } // namespace gpud::vulkan

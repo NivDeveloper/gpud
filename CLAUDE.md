@@ -3,10 +3,12 @@
 Minimal GPU compute abstraction. Namespace `gpud`; plain C++20
 (std::span is the floor — no C++23/26, no reflection); must build with
 the system default compiler (AppleClang). Design rationale:
-docs/design.md. Current state: interface + header-only mock backend +
-auto-selection skeleton + scaffolding stubs for the cuda/metal/vulkan
-backends (their try_open always returns nullptr; no SDK is included,
-located, or linked anywhere). No real GPU backend is implemented yet.
+docs/design.md; implementation plan: docs/backend-implementation.md.
+Current state: interface + header-only mock + auto-selection + the
+Vulkan backend (implemented: volk-loaded, BDA push-constant ABI,
+slangc do_compile, blocking v1 run; works on MoltenVK with zero
+Apple-specific code). cuda/metal remain scaffolding stubs (try_open
+returns nullptr).
 
 ## Invariants (do not break)
 
@@ -54,17 +56,31 @@ include/gpud/Cuda.h        cuda::try_open declaration only — never SDK types
 include/gpud/Metal.h       metal::try_open declaration only
 include/gpud/Vulkan.h      vulkan::try_open declaration only
 src/auto/open_default.cpp  env override + #ifdef GPUD_HAS_* priority chain
-src/{cuda,metal,vulkan}/   backend scaffolding — the include firewall:
+src/{cuda,metal,vulkan}/   backends — the include firewall (SDK types
+                           live only here; cuda/metal still stubs):
   Device.h / Device.cpp      Device subclass; try_open, run, teardown
   Buffer.h / Buffer.cpp      BufferImpl (: Buffer::Impl) + alloc/write/read
   Kernel.h / Kernel.cpp      KernelImpl (: Kernel::Impl) + do_compile
-  CMakeLists.txt             stub lib; comments show the PRIVATE SDK link lines
-tests/                     gtest suite + Device.h standalone-compile check
+  CMakeLists.txt             deps: fetch/find per backend, linked PRIVATE
+tests/                     device_test (mock/open_default units),
+                           conformance_test (same suite over every
+                           backend; real ones skip when try_open fails),
+                           Device.h standalone-compile check
 docs/design.md             full design rationale
 docs/backend-implementation.md  the plan for implementing backends
                            (dependency/error policy, step order,
                            conformance suite, per-backend specifics)
 ```
+
+Vulkan specifics worth knowing before touching src/vulkan: no SDK is
+linked — volk (fetched, compiled in) dlopens the loader at runtime, and
+headers come from find_package(Vulkan) or a fetched pinned
+Vulkan-Headers; requires driver bufferDeviceAddress (no descriptor-set
+fallback); push data = scalar blob then 8-aligned buffer addresses,
+range fixed at 128 bytes; ~Device must clear_kernels() before
+vkDestroyDevice (base cache destructs after derived dtor); the
+portability-enumeration/subset handling is generic Khronos portability
+code, NOT MoltenVK-specific — keep it free of platform #ifdefs.
 
 Backend-internal headers (src/*/[A-Z]*.h) are never installed and never
 included from include/gpud/*; they are where SDK types will live. The
@@ -98,21 +114,26 @@ Tests fetch googletest via FetchContent (needs network on first
 configure). tests/device_h_standalone.cpp is a build-time check that
 Device.h compiles alone under -std=c++20.
 
-## Implementing a backend (example: vulkan)
+## Implementing a backend (metal/cuda; vulkan is the worked reference)
 
-The scaffolding already exists: factory header, the src/ dir with class
+Follow docs/backend-implementation.md and mirror src/vulkan. The
+scaffolding already exists: factory header, the src/ dir with class
 skeletons (Device subclass, BufferImpl, KernelImpl — every TODO(impl)
 marks a hole) and its CMakeLists, the option gate, GPUD_HAS_* plumbing,
-and the open_default arms. To implement:
+the open_default arms, and the conformance suite (add the backend's
+factory + saxpy kernel source to tests/conformance_test.cpp). To
+implement:
 
-1. In `src/vulkan/`: fill the TODO(impl) holes — SDK state into the
+1. In `src/<backend>/`: fill the TODO(impl) holes — SDK state into the
    headers' member slots, real bodies replacing the unimplemented()
    stubs (Device.cpp: try_open + run; Buffer.cpp: alloc/write/read;
    Kernel.cpp: do_compile). try_open constructs the Device (still
-   nullptr when no driver/device/compiler). SDK headers are included
-   ONLY in this dir — the public header must keep declaring the factory
-   with no SDK types. Keep teardown ordering, driver quirks, and
-   compiler invocations private to these files.
+   nullptr when no driver/device/compiler, quietly; GPUD_LOG=1
+   explains). SDK headers are included ONLY in this dir — the public
+   header must keep declaring the factory with no SDK types. Keep
+   teardown ordering, driver quirks, and compiler invocations private
+   to these files. If Kernel impls hold device resources, the Device
+   destructor must call clear_kernels() before releasing them.
 2. In `src/vulkan/CMakeLists.txt`: locate the SDK and link it PRIVATE
    (the top comment there shows the exact lines). Metal additionally
    becomes Objective-C++: Metal.cpp → Metal.mm + enable_language(OBJCXX).

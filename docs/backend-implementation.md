@@ -76,7 +76,12 @@ entry.
 Performance (staging, batching, buffer residency), internal locking,
 streams, capability introspection beyond dialect().
 
-## Vulkan (first, in full)
+## Vulkan (first, in full) — IMPLEMENTED as planned
+
+Everything below was built as written (plus one interface addition the
+plan missed: base-class kernel cache members destruct after the derived
+destructor, so gpud::Device grew a protected clear_kernels() that
+backend destructors call before tearing down device state).
 
 Works on macOS through MoltenVK with **zero MoltenVK-specific code**:
 everything Apple-flavored below is the generic Khronos portability

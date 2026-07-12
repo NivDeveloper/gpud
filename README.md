@@ -5,9 +5,9 @@ five operations — `alloc`, `write`, `read`, `compile`, `run`. Backends
 are separate static libraries; your code never sees an SDK header, and
 there is no global state — you open a `Device` and everything dies with it.
 
-**Status: early.** The interface, a mock backend for testing, and
-auto-selection work. The CUDA / Metal / Vulkan backends are unimplemented
-stubs.
+**Status: early.** The interface, a mock backend for testing,
+auto-selection, and the **Vulkan backend** work (macOS included, via
+MoltenVK). CUDA and Metal are unimplemented stubs.
 
 ## Build
 
@@ -18,9 +18,16 @@ make            # or: cmake -B build && cmake --build build
 make test
 ```
 
-Needs CMake ≥ 3.24 and any C++20 compiler. Backends are opt-in at
-configure time: `-DGPUD_BACKEND_VULKAN=ON` (also `_METAL`, `_CUDA`;
-all OFF while they are stubs).
+Needs CMake ≥ 3.24 and any C++20 compiler — nothing else: the Vulkan
+backend fetches its build dependencies (Khronos headers, volk) and
+never links a Vulkan SDK. It builds by default where Vulkan dev files
+exist; force it anywhere with `-DGPUD_BACKEND_VULKAN=ON` (`_METAL` /
+`_CUDA` exist too, OFF while they are stubs).
+
+**Running** on the GPU needs a Vulkan ≥ 1.2 driver with
+buffer-device-address (macOS: `brew install molten-vk`) and `slangc`
+on PATH; without them `try_open()`/`open_default()` just return null
+(`GPUD_LOG=1` explains why).
 
 ## Use in a project
 
