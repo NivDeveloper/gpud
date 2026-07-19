@@ -13,6 +13,7 @@
 
 #include <volk.h>
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 

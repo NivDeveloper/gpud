@@ -12,6 +12,7 @@
 
 #include <gpud/Vulkan.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

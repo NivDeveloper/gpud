@@ -2,6 +2,7 @@
 #include "Kernel.h"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>

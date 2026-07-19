@@ -2,6 +2,7 @@
 #include "Device.h"
 
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 
