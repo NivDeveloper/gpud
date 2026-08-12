@@ -7,6 +7,8 @@
 
 #include <volk.h>
 
+#include <vk_mem_alloc.h>
+
 #include <cstdint>
 
 namespace gpud::vulkan {
@@ -16,11 +18,13 @@ class Device;   // ~BufferImpl defers its teardown to the owning Device
 // Host-visible, host-coherent, persistently mapped storage buffer with
 // a device address (the BDA push-constant ABI). Simple and — on unified
 // memory (Apple Silicon, iGPUs) — fast; staging is a post-v1 concern.
+// The allocation is a suballocation of one of VMA's blocks, so it may
+// well be memory a destroyed Buffer used to hold.
 struct BufferImpl final : ::gpud::Buffer::Impl {
-    Device *owner{};     // non-owning; the Device that allocated this
-    VkDevice device{};   // non-owning, for destruction
+    Device *owner{};          // non-owning; the Device that allocated this
+    VmaAllocator allocator{};   // non-owning, for destruction
     VkBuffer buffer{};
-    VkDeviceMemory memory{};
+    VmaAllocation allocation{};
     void *mapped{};
     VkDeviceAddress address{};
 

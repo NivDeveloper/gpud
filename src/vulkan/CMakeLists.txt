@@ -13,7 +13,8 @@ enable_language(C)   # volk.c
 add_library(gpud_vulkan STATIC
     Device.h Device.cpp     # try_open, run, teardown
     Buffer.h Buffer.cpp     # BufferImpl + alloc/write/read
-    Kernel.h Kernel.cpp)    # KernelImpl + do_compile (slangc)
+    Kernel.h Kernel.cpp     # KernelImpl + do_compile (slangc)
+    Vma.cpp)                # the VMA implementation, alone in its TU
 add_library(gpud::vulkan ALIAS gpud_vulkan)
 target_link_libraries(gpud_vulkan PUBLIC gpud::gpud)
 if(CMAKE_DL_LIBS)
@@ -25,7 +26,14 @@ set_target_properties(gpud_vulkan PROPERTIES
 # the standard Vulkan idiom — the omitted fields zero-initialize.
 target_compile_options(gpud_vulkan PRIVATE -Wall -Wextra
     -Wno-missing-field-initializers)
-target_compile_definitions(gpud_vulkan PRIVATE VK_NO_PROTOTYPES)
+# VMA has to agree with volk about how Vulkan is resolved, and every TU
+# including its header must see the same configuration as the one that
+# compiles it — hence on the target rather than in Vma.cpp.
+target_compile_definitions(gpud_vulkan PRIVATE VK_NO_PROTOTYPES
+    VMA_STATIC_VULKAN_FUNCTIONS=0 VMA_DYNAMIC_VULKAN_FUNCTIONS=1)
+# VMA's implementation is not warning-clean under -Wall -Wextra; keeping
+# it quiet here stops it burying warnings from our own sources.
+set_source_files_properties(Vma.cpp PROPERTIES COMPILE_OPTIONS "-w")
 
 find_package(Vulkan QUIET)
 if(Vulkan_FOUND)
@@ -48,3 +56,16 @@ FetchContent_Declare(volk
 FetchContent_MakeAvailable(volk)
 target_sources(gpud_vulkan PRIVATE ${volk_SOURCE_DIR}/volk.c)
 target_include_directories(gpud_vulkan PRIVATE ${volk_SOURCE_DIR})
+
+# VMA (header-only): suballocates from large blocks, which is what
+# removes the per-buffer vkAllocateMemory/vkMapMemory that dominated
+# alloc(). Fetched download-only by the same SOURCE_SUBDIR trick as volk
+# — its own CMakeLists would drag in its options and a find_package(Vulkan)
+# requirement this backend deliberately does without.
+FetchContent_Declare(VulkanMemoryAllocator
+  GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+  GIT_TAG v3.3.0
+  SOURCE_SUBDIR sources-only-no-cmake)
+FetchContent_MakeAvailable(VulkanMemoryAllocator)
+target_include_directories(gpud_vulkan PRIVATE
+    ${vulkanmemoryallocator_SOURCE_DIR}/include)

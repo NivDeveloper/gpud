@@ -13,6 +13,8 @@
 
 #include <volk.h>
 
+#include <vk_mem_alloc.h>
+
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -45,7 +47,7 @@ class Device final : public ::gpud::Device {
         VkCommandPool pool{};
         VkSemaphore timeline{};  // the device timeline; each batch signals
                                  // the ticket of its last dispatch
-        VkPhysicalDeviceMemoryProperties memory{};
+        VmaAllocator allocator{};
         std::string slangc;      // resolved compiler path
     };
 

@@ -115,13 +115,11 @@ TEST_P(Conformance, WriteReadRoundTrip) {
     EXPECT_EQ(std::memcmp(in.data(), out.data(), sizeof in), 0);
 }
 
-TEST_P(Conformance, FreshBufferReadsZeros) {
-    gpud::Buffer buf = dev_->alloc(32);
-    std::array<std::byte, 32> out;
-    out.fill(std::byte{0xff});
-    dev_->read(buf, out.data(), out.size());
-    for (std::byte b : out) EXPECT_EQ(int(b), 0);
-}
+// No FreshBufferReadsZeros here on purpose: a freshly alloc()ed buffer's
+// contents are unspecified (contract note 4), because a backend is free
+// to hand back memory a destroyed Buffer used to own. The mock still
+// zero-fills — it is a test double, and consumers assert on its log —
+// which MockDevice.UnwrittenBufferReadsAsZeros covers.
 
 TEST_P(Conformance, SaxpyEndToEnd) {
     if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";

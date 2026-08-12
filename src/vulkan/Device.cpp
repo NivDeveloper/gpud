@@ -169,7 +169,6 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
         return fail("vkCreateDevice failed");
     volkLoadDevice(s.device);
     vkGetDeviceQueue(s.device, s.queue_family, 0, &s.queue);
-    vkGetPhysicalDeviceMemoryProperties(s.phys, &s.memory);
 
     // The command pool batches are recorded into (allocated lazily and
     // recycled — see begin_batch_locked) plus the timeline semaphore
@@ -191,6 +190,31 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
         return fail("vkCreateSemaphore failed");
     }
 
+    // VMA suballocates from large blocks, which is what keeps alloc()
+    // off vkAllocateMemory/vkMapMemory. BUFFER_DEVICE_ADDRESS is
+    // load-bearing rather than stylistic: it is what makes VMA tag the
+    // backing allocation with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    // without which a buffer created for BDA cannot be bound. Only the
+    // two getters are supplied — with dynamic functions VMA imports the
+    // rest through them.
+    VmaVulkanFunctions vf{};
+    vf.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    vf.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+    VmaAllocatorCreateInfo aci{};
+    aci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    aci.physicalDevice = s.phys;
+    aci.device = s.device;
+    aci.instance = s.instance;
+    // Matches the instance above: claiming a higher version would let VMA
+    // reach for entry points this device never loaded.
+    aci.vulkanApiVersion = VK_API_VERSION_1_2;
+    aci.pVulkanFunctions = &vf;
+    if (vmaCreateAllocator(&aci, &s.allocator) != VK_SUCCESS) {
+        vkDestroySemaphore(s.device, s.timeline, nullptr);
+        vkDestroyCommandPool(s.device, s.pool, nullptr);
+        return fail("vmaCreateAllocator failed");
+    }
+
     return std::make_unique<Device>(s);
 }
 
@@ -204,6 +228,10 @@ Device::~Device() {
     // never reached — an open batch that was never submitted has some.
     reclaim_locked(true);
     clear_kernels();   // KernelImpls hold pipelines — before the VkDevice
+    // After the drain, whose release closures call vmaDestroyBuffer.
+    // (It asserts if any allocation is still live, which is a free check
+    // that the drain above really emptied out.)
+    vmaDestroyAllocator(s.allocator);
     vkDestroySemaphore(s.device, s.timeline, nullptr);
     // Frees every command buffer allocated from it, batch_ included.
     vkDestroyCommandPool(s.device, s.pool, nullptr);
