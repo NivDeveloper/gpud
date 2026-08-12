@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -24,6 +25,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -236,6 +238,137 @@ TEST_P(Conformance, BufferDestroyedAfterRunIsSafe) {
     dev.read(bo, out.data(), N * sizeof(float));
     for (std::uint32_t i = 0; i < N; ++i)
         ASSERT_EQ(out[i], a[i] + S * b[i]) << "index " << i;
+}
+
+// A chain where every dispatch reads what the previous one wrote — the
+// least-covered path today, and the one a backend that queues work can
+// get silently wrong rather than loudly. saxpy with s = 1 and both
+// inputs aimed at the same buffer is a doubling (out = in + 1*in), so
+// after L links out[i] == i * 2^L: exact in float for i < 2^24, since
+// doubling only moves the exponent.
+//
+// The chain is deliberately longer than any plausible queue-depth cap,
+// so it also covers the batch boundaries, throttling and command-buffer
+// reuse a batching backend has to get right. (It is NOT a barrier
+// detector on its own — a driver that happens to serialize dispatches
+// passes it either way. Synchronization validation is what checks the
+// barrier; see docs.)
+TEST_P(Conformance, DispatchChainClosedForm) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    gpud::Device &dev = *dev_;
+
+    constexpr std::uint32_t N = 1000;
+    constexpr int LINKS = 100;   // 999 * 2^100 is far below FLT_MAX
+    constexpr int MID = 50;
+
+    std::vector<float> seed(N), out(N);
+    for (std::uint32_t i = 0; i < N; ++i) seed[i] = float(i);
+
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+    dev.write(a, seed.data(), N * sizeof(float));
+
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    const SaxpyScalars sc{1.0f, N};
+
+    gpud::Buffer *src = &a, *dst = &b;
+    for (int link = 1; link <= LINKS; ++link) {
+        gpud::Buffer *buffers[] = {dst, src, src};
+        dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+        std::swap(src, dst);   // *src now holds this link's output
+
+        // One read partway through, which must force the queued half of
+        // the chain to complete and hand back exactly this link's
+        // value — neither the seed nor the final answer.
+        if (link == MID) {
+            dev.read(*src, out.data(), N * sizeof(float));
+            const float scale = std::ldexp(1.0f, MID);
+            for (std::uint32_t i = 0; i < N; ++i)
+                ASSERT_EQ(out[i], float(i) * scale)
+                    << "index " << i << " at link " << MID;
+        }
+    }
+
+    dev.read(*src, out.data(), N * sizeof(float));
+    const float scale = std::ldexp(1.0f, LINKS);
+    for (std::uint32_t i = 0; i < N; ++i)
+        ASSERT_EQ(out[i], float(i) * scale) << "index " << i;
+}
+
+// Writing into a buffer that a queued dispatch still reads must not
+// race it: the first run's output has to reflect the data that was in
+// the buffer when it was issued, not what the host put there after.
+TEST_P(Conformance, WriteAfterRunSynchronizes) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    gpud::Device &dev = *dev_;
+
+    constexpr std::uint32_t N = 1000;
+    const std::vector<float> first(N, 1.0f), second(N, 8.0f);
+    std::vector<float> out1(N, -1.0f), out2(N, -1.0f);
+
+    gpud::Buffer in = dev.alloc(N * sizeof(float));
+    gpud::Buffer o1 = dev.alloc(N * sizeof(float));
+    gpud::Buffer o2 = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    const SaxpyScalars sc{1.0f, N};   // out = in + in
+
+    dev.write(in, first.data(), N * sizeof(float));
+    gpud::Buffer *b1[] = {&o1, &in, &in};
+    dev.run(k, (N + 63) / 64, blob_of(sc), b1);
+
+    dev.write(in, second.data(), N * sizeof(float));   // waits out run 1
+    gpud::Buffer *b2[] = {&o2, &in, &in};
+    dev.run(k, (N + 63) / 64, blob_of(sc), b2);
+
+    dev.read(o1, out1.data(), N * sizeof(float));
+    dev.read(o2, out2.data(), N * sizeof(float));
+    for (std::uint32_t i = 0; i < N; ++i) {
+        ASSERT_EQ(out1[i], 2.0f) << "index " << i;
+        ASSERT_EQ(out2[i], 16.0f) << "index " << i;
+    }
+}
+
+// Allocate, use and destroy in a tight loop with nothing read until the
+// end, so releases pile up behind work that is still queued and the
+// allocator is free to hand the same memory back out. A release that
+// ran too early — or memory recycled into a later alloc() before the
+// dispatch reading it had finished — corrupts the arithmetic.
+TEST_P(Conformance, RecycleWhileQueued) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    gpud::Device &dev = *dev_;
+
+    constexpr std::uint32_t N = 256;
+    constexpr int ROUNDS = 200;
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    const SaxpyScalars sc{1.0f, N};
+
+    const auto seed_of = [](int round, std::uint32_t i) {
+        return float(round * 1000 + int(i));
+    };
+
+    std::vector<float> in(N), out(N);
+    std::vector<gpud::Buffer> outputs;
+    outputs.reserve(ROUNDS);
+
+    for (int round = 0; round < ROUNDS; ++round) {
+        for (std::uint32_t i = 0; i < N; ++i) in[i] = seed_of(round, i);
+
+        gpud::Buffer o = dev.alloc(N * sizeof(float));
+        {
+            gpud::Buffer src = dev.alloc(N * sizeof(float));
+            dev.write(src, in.data(), N * sizeof(float));
+            gpud::Buffer *buffers[] = {&o, &src, &src};
+            dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+        }   // src dies here, its dispatch very likely still queued
+        outputs.push_back(std::move(o));
+    }
+
+    for (int round = 0; round < ROUNDS; ++round) {
+        dev.read(outputs[std::size_t(round)], out.data(), N * sizeof(float));
+        for (std::uint32_t i = 0; i < N; ++i)
+            ASSERT_EQ(out[i], 2.0f * seed_of(round, i))
+                << "round " << round << " index " << i;
+    }
 }
 
 TEST_P(Conformance, BadKernelThrowsWithDiagnostics) {

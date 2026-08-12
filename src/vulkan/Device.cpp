@@ -171,19 +171,15 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     vkGetDeviceQueue(s.device, s.queue_family, 0, &s.queue);
     vkGetPhysicalDeviceMemoryProperties(s.phys, &s.memory);
 
-    // One reusable command buffer — run() submits and blocks (v1) — plus
-    // the timeline semaphore every submission signals.
+    // The command pool batches are recorded into (allocated lazily and
+    // recycled — see begin_batch_locked) plus the timeline semaphore
+    // every submission signals. RESET_COMMAND_BUFFER_BIT is what lets a
+    // completed buffer be re-recorded by vkBeginCommandBuffer alone.
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = s.queue_family;
     if (vkCreateCommandPool(s.device, &pci, nullptr, &s.pool) != VK_SUCCESS)
         return fail("vkCreateCommandPool failed");
-    VkCommandBufferAllocateInfo cai{
-        VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cai.commandPool = s.pool;
-    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cai.commandBufferCount = 1;
-    vkAllocateCommandBuffers(s.device, &cai, &s.cmd);
 
     VkSemaphoreTypeCreateInfo stci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     stci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -199,20 +195,26 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
 }
 
 Device::~Device() {
+    // Nothing else may touch a dying Device (handles don't outlive it,
+    // and the thread-safe corner is for live devices), so no lock here.
     vkDeviceWaitIdle(s.device);
     // Unconditional: the device is idle, so every deferred release is
     // safe to run regardless of what its ticket says. A ticket-checked
-    // drain here would strand entries behind any ticket the timeline
-    // never reached.
-    drain(true);
+    // reclaim would strand entries sitting behind a ticket the timeline
+    // never reached — an open batch that was never submitted has some.
+    reclaim_locked(true);
     clear_kernels();   // KernelImpls hold pipelines — before the VkDevice
     vkDestroySemaphore(s.device, s.timeline, nullptr);
+    // Frees every command buffer allocated from it, batch_ included.
     vkDestroyCommandPool(s.device, s.pool, nullptr);
     vkDestroyDevice(s.device, nullptr);
     vkDestroyInstance(s.instance, nullptr);
 }
 
 std::uint64_t Device::completed() const {
+    // Lock-free by design: vkGetSemaphoreCounterValue has no externally
+    // synchronized parameter, so polling while another thread submits is
+    // allowed.
     std::uint64_t value = 0;
     check(vkGetSemaphoreCounterValue(s.device, s.timeline, &value),
           "vkGetSemaphoreCounterValue");
@@ -220,36 +222,158 @@ std::uint64_t Device::completed() const {
 }
 
 void Device::wait(std::uint64_t ticket) {
+    std::unique_lock lock(m_);
+    wait_locked(lock, ticket);
+}
+
+void Device::wait_locked(std::unique_lock<std::mutex> &lock,
+                         std::uint64_t ticket) {
     // Clamp rather than hang: a ticket beyond the last one issued would
     // block on a value nothing will ever signal.
-    if (ticket > submitted_) ticket = submitted_;
-    if (ticket != 0 && completed() < ticket) {
+    const std::uint64_t issued = submitted_.load(std::memory_order_relaxed);
+    if (ticket > issued) ticket = issued;
+    if (ticket == 0) return;
+
+    // The work may still be sitting in the open batch — waiting for it
+    // without submitting it first would deadlock against ourselves.
+    if (ticket > last_submitted_) submit_batch_locked();
+
+    if (completed_cache_ < ticket) {
         VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         wi.semaphoreCount = 1;
         wi.pSemaphores = &s.timeline;
         wi.pValues = &ticket;
-        check(vkWaitSemaphores(s.device, &wi, UINT64_MAX), "vkWaitSemaphores");
+        // Unlocked across the block: this is the only long wait, and
+        // holding m_ through it would stall every other thread's poll.
+        lock.unlock();
+        const VkResult r = vkWaitSemaphores(s.device, &wi, UINT64_MAX);
+        lock.lock();
+        check(r, "vkWaitSemaphores");
     }
-    drain(false);
+    reclaim_locked(false);
 }
 
 void Device::defer_release(std::uint64_t ticket, std::function<void()> release) {
-    if (ticket <= completed()) {
+    std::lock_guard lock(m_);
+    if (ticket <= completed_cache_ || ticket <= completed()) {
         release();
         return;
     }
     deferred_.push_back({ticket, std::move(release)});
 }
 
-void Device::drain(bool force) {
-    // Tickets only ever increase, so the queue is ordered and the first
-    // entry that isn't ready means none behind it are either.
-    const std::uint64_t done = force ? 0 : completed();
-    while (!deferred_.empty() &&
-           (force || deferred_.front().ticket <= done)) {
+void Device::reclaim() {
+    std::lock_guard lock(m_);
+    reclaim_locked(false);
+}
+
+void Device::reclaim_locked(bool force) {
+    if (!force) completed_cache_ = completed();
+    const std::uint64_t done = completed_cache_;
+
+    // Tickets only increase, so both queues are ordered: the first entry
+    // that isn't ready means none behind it are either.
+    //
+    // A release closure must only destroy resources. Anything that
+    // re-entered defer_release() — destroying a Buffer, say — would
+    // deadlock on m_, which is deliberately not recursive.
+    while (!deferred_.empty() && (force || deferred_.front().ticket <= done)) {
         deferred_.front().release();
         deferred_.pop_front();
     }
+    while (!pending_.empty() && (force || pending_.front().ticket <= done)) {
+        free_.push_back(pending_.front().cmd);
+        pending_.pop_front();
+    }
+}
+
+VkCommandBuffer Device::begin_batch_locked() {
+    if (batch_) return batch_;
+
+    if (free_.empty()) {
+        VkCommandBufferAllocateInfo cai{
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = s.pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkCommandBuffer cmd{};
+        check(vkAllocateCommandBuffers(s.device, &cai, &cmd),
+              "vkAllocateCommandBuffers");
+        free_.push_back(cmd);
+    }
+
+    // Begin before popping, so a failure leaves the buffer on the free
+    // list rather than losing it.
+    VkCommandBuffer cmd = free_.back();
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
+    free_.pop_back();
+    batch_ = cmd;
+    return cmd;
+}
+
+void Device::submit_batch_locked() {
+    // Nothing recorded since the last submit: a timeline signal must be
+    // strictly greater than the current value, so submitting an empty
+    // batch would be invalid. Any partially-recorded batch stays open
+    // for the next run() to continue into.
+    const std::uint64_t ticket = submitted_.load(std::memory_order_relaxed);
+    if (ticket == last_submitted_) return;
+
+    // Make this batch's writes available to the host. read() waits on
+    // the semaphore, and the memory model's route from the device domain
+    // to the host domain is a dependency with HOST in the destination
+    // stage — the same shape whether the wait is on a fence or a
+    // timeline. One per batch, and free on unified memory.
+    VkMemoryBarrier host{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    host.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(batch_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
+                         nullptr);
+
+    VkResult r = vkEndCommandBuffer(batch_);
+    if (r == VK_SUCCESS) {
+        VkTimelineSemaphoreSubmitInfo tssi{
+            VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+        tssi.signalSemaphoreValueCount = 1;   // must match signalSemaphoreCount
+        tssi.pSignalSemaphoreValues = &ticket;
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.pNext = &tssi;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &batch_;
+        si.signalSemaphoreCount = 1;
+        si.pSignalSemaphores = &s.timeline;
+        r = vkQueueSubmit(s.queue, 1, &si, VK_NULL_HANDLE);
+    }
+
+    pending_.push_back({ticket, batch_});
+    batch_ = VK_NULL_HANDLE;
+    last_submitted_ = ticket;
+
+    if (r != VK_SUCCESS) {
+        // The tickets were handed out when the dispatches were recorded,
+        // so the timeline owes this value — but a failed submit means the
+        // GPU will never signal it, and every later wait(), teardown
+        // included, would block forever. Signal it from the host and let
+        // the throw be what tells the caller the work did not happen.
+        VkSemaphoreSignalInfo ssi{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO};
+        ssi.semaphore = s.timeline;
+        ssi.value = ticket;
+        vkSignalSemaphore(s.device, &ssi);
+        check(r, "vkQueueSubmit");
+    }
+}
+
+void Device::throttle_locked(std::unique_lock<std::mutex> &lock) {
+    // Keep queued-but-unfinished work bounded, which bounds recorded
+    // commands, in-flight submissions and deferred memory at once. Costs
+    // one stall per max_queued_ dispatches. completed_cache_ was just
+    // refreshed by reclaim_locked, so the common path polls nothing.
+    const std::uint64_t issued = submitted_.load(std::memory_order_relaxed);
+    if (issued - completed_cache_ < max_queued_) return;
+    wait_locked(lock, issued - max_queued_ + 1);
 }
 
 void Device::run(const Kernel &kernel, std::size_t groups,
@@ -269,37 +393,43 @@ void Device::run(const Kernel &kernel, std::size_t groups,
     for (std::size_t i = 0; i < buffers.size(); ++i)
         std::memcpy(push + addr_off + 8 * i, &impl_of(*buffers[i]).address, 8);
 
-    // Record + submit + wait. The per-run wait is what makes the ordering
-    // contract trivially hold; batching with sync-at-read() is the
-    // planned optimization and only touches this file.
-    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    check(vkBeginCommandBuffer(s.cmd, &bi), "vkBeginCommandBuffer");
-    vkCmdBindPipeline(s.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
-    vkCmdPushConstants(s.cmd, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+    // Record only — no submit, no wait. Work accumulates in the open
+    // batch until something has to observe it: read(), a write() into a
+    // buffer with queued work, an explicit wait()/flush(), the throttle
+    // below, or teardown.
+    std::unique_lock lock(m_);
+    reclaim_locked(false);
+    throttle_locked(lock);
+
+    VkCommandBuffer cmd = begin_batch_locked();
+
+    // Order this dispatch against every dispatch already queued. A
+    // pipeline barrier's first synchronization scope covers all commands
+    // earlier in *submission order on the queue*, so this single barrier
+    // covers the previous dispatch whether it sits in this batch or in
+    // one already submitted — which holds because a gpud Device owns
+    // exactly one queue. The access masks cover read- and
+    // write-after-write; write-after-read needs only the execution
+    // dependency the stage masks already give.
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
+                         0, nullptr, 0, nullptr);
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, k->pipeline);
+    vkCmdPushConstants(cmd, k->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                        sizeof push, push);
-    vkCmdDispatch(s.cmd, std::uint32_t(groups), 1, 1);
-    check(vkEndCommandBuffer(s.cmd), "vkEndCommandBuffer");
+    vkCmdDispatch(cmd, std::uint32_t(groups), 1, 1);
 
-    // This run's ticket. It is claimed only once the submit succeeded:
-    // a throw before that point leaves the timeline consistent, so a
-    // later wait() can never block on a value nothing will signal.
-    const std::uint64_t ticket = submitted_ + 1;
-    VkTimelineSemaphoreSubmitInfo tssi{
-        VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-    tssi.signalSemaphoreValueCount = 1;   // must match signalSemaphoreCount
-    tssi.pSignalSemaphoreValues = &ticket;
-    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    si.pNext = &tssi;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &s.cmd;
-    si.signalSemaphoreCount = 1;
-    si.pSignalSemaphores = &s.timeline;
-    check(vkQueueSubmit(s.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
-    submitted_ = ticket;
+    // Claim the ticket only now that the dispatch is fully recorded. The
+    // lock has not been released since begin_batch_locked(), so no other
+    // thread can have submitted a batch promising work that isn't there.
+    const std::uint64_t ticket = submitted_.load(std::memory_order_relaxed) + 1;
+    submitted_.store(ticket, std::memory_order_release);
     for (Buffer *b : buffers) impl_of(*b).last_use = ticket;
-
-    wait(ticket);
 }
 
 } // namespace gpud::vulkan

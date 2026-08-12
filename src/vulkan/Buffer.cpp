@@ -23,7 +23,7 @@ BufferImpl::~BufferImpl() {
 }
 
 Buffer Device::alloc(std::size_t bytes) {
-    drain(false);   // reclaim what finished since the last call
+    reclaim();   // hand back whatever the GPU has finished with
 
     auto impl = std::make_unique<BufferImpl>();
     impl->owner = this;
