@@ -12,10 +12,14 @@
 // Contract (v1):
 //
 //  1. Ordering. Calls on one Device behave as if executed in call order.
+//     Any operation on a buffer with queued work synchronizes first:
 //     read() returns only after every prior run() touching that buffer
-//     has completed. A backend may batch/queue work internally and
-//     synchronize only at read(); a simple backend may make every call
-//     blocking. There are no fences, events, or streams in the interface.
+//     has completed, and write() likewise waits rather than overwriting
+//     storage a queued dispatch still reads. A backend may batch/queue
+//     work internally and synchronize only where the host observes it; a
+//     simple backend may make every call blocking. There are no fences,
+//     events, or streams in the interface — to watch progress without
+//     forcing it, see the device timeline on Device below.
 //
 //  2. Positional buffers. run()'s buffer list is positional: buffers[0]
 //     is the output, buffers[1 + k] is input leaf k. The caller and the
@@ -25,13 +29,23 @@
 //     business, paired with its dialect(). gpud carries no reflection
 //     metadata.
 //
-//  3. External synchronization. Calls on one Device must be externally
-//     synchronized (v1). Distinct Devices are independent.
+//  3. External synchronization, with one carve-out. Calls on one Device
+//     must be externally synchronized — except submitted(), completed()
+//     and wait(), which are safe to call from another thread while one
+//     is inside a Device call. Observing the timeline from elsewhere is
+//     the entire point of exposing it, so it would be useless otherwise.
+//     Distinct Devices are independent.
 //
 //  4. Lifetime. All state hangs off the Device and dies with it; there
 //     is no library-wide init or shutdown. Handles (Buffer, Kernel) must
 //     not outlive the Device that created them, and must only be passed
-//     back to that same Device.
+//     back to that same Device. A Buffer may be destroyed while work
+//     using it is still queued: the backend keeps the memory alive as
+//     long as anything queued still needs it, so callers need not track
+//     that themselves. In exchange, the contents of a freshly alloc()ed
+//     buffer are UNSPECIFIED — it may well be backed by memory a
+//     destroyed Buffer used to own — so write before you read. (The mock
+//     zero-fills, being a test double; no backend promises it.)
 //
 //  5. Errors. Backend factories (gpud::<backend>::try_open) never throw:
 //     they return nullptr when the backend can't come up, for any reason
@@ -54,6 +68,21 @@ namespace gpud {
 // minimal.
 struct Options {
     int device_index = -1;   // -1 = let the backend pick the obvious device
+
+    // Ceiling on dispatches queued but not yet completed. Reaching it
+    // makes run() submit what it has and wait for the oldest excess
+    // ticket before recording more, which is what stops queued commands,
+    // in-flight submissions and memory awaiting release from growing
+    // without bound. Costs one stall per max_queued dispatches; raise it
+    // to let the host run further ahead, lower it to cap latency and
+    // retained memory. Values below 1 are treated as 1.
+    std::uint32_t max_queued = 64;
+
+    // Ceiling in bytes on the device memory a backend's allocator may
+    // hold; 0 = no limit. Past it an alloc() fails rather than the pool
+    // growing indefinitely. Backends that allocate per buffer, with no
+    // pool to bound, ignore it.
+    std::size_t pool_budget_bytes = 0;
 };
 
 // Move-only RAII handle to a device allocation. Backends subclass Impl;

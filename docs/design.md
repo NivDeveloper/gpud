@@ -13,7 +13,9 @@ auto-selection work.
 
 1. **The interface is one abstract class with five operations** —
    `alloc`/`write`/`read` (storage), `compile` (build), `run` (launch) —
-   plus a single introspection member, `dialect()`.
+   plus a single introspection member, `dialect()`, and (since 0.2) the
+   device timeline `submitted`/`completed`/`wait` for observing queued
+   work without forcing it.
 2. **Backends are separately compiled static libraries** — one per
    backend, each linking its SDK privately. The interface header stays
    dependency-free (std only).
@@ -100,10 +102,13 @@ class Device {
 ```
 
 **Semantic contract** (replaces fences/queues/events in the interface):
-calls on one `Device` behave as if executed in call order, and `read`
-returns only after every prior `run` touching that buffer has
-completed. A simple backend makes everything blocking; a Vulkan backend
-is free to batch submissions and only sync at `read`.
+calls on one `Device` behave as if executed in call order, and any
+operation on a buffer with queued work synchronizes first — `read`
+returns only after every prior `run` touching that buffer has completed,
+and `write` waits rather than overwriting storage a queued dispatch
+still reads. A simple backend makes everything blocking; the Vulkan
+backend batches submissions and syncs only where the host observes
+(see the device timeline below).
 
 **Positional buffer ABI.** The agreement about *order* is between the
 caller and whatever generated the kernel source; gpud carries no
@@ -123,9 +128,11 @@ or static storage). Content equality is irrelevant — identity is the
 key — so a caller whose sources are compile-time constants gets exact,
 zero-hash caching for free.
 
-**Threading (v1).** Calls on one Device are externally synchronized;
-distinct Devices are independent. Internal locking can come later
-without an interface change.
+**Threading.** Calls on one Device are externally synchronized, with one
+carve-out: `submitted`/`completed`/`wait` may be called from another
+thread while one is inside a Device call, since observing the timeline
+from elsewhere is the only reason to expose it. Distinct Devices are
+independent.
 
 **Why these five and not more**: `alloc`/`write`/`read` is the minimum
 to get data there and back; `compile`/`run` is literally "build and run
@@ -283,13 +290,23 @@ std::unique_ptr<Device> open_default() {
   first-class handles; it is follow-up work, not part of the minimum.
 - **External synchronization only.** No internal locking, no streams;
   the ordering contract covers correctness, and either can be added
-  later without changing the interface (see the synchronization note
-  below for the accepted extension shape).
+  later without changing the interface. *(Partly closed since: the
+  device timeline below is built, and with it a narrow thread-safety
+  carve-out. Streams remain deliberately absent — the answer to queue
+  parallelism is still "open two Devices".)*
+- **Blocking submission.** *(Closed. The Vulkan backend batches; see
+  the device timeline below.)*
 
-## Future: finer-grained synchronization (design note, accepted shape — not built)
+## Finer-grained synchronization: the device timeline (BUILT, 2026-08)
 
-If host-visible sync ever gets added, it is a **device timeline**
-(tickets), not semaphore objects.
+Built as designed below, together with batched submission and recycled
+allocation — they are one mechanism, not three, because all of them
+reduce to *has the work touching this memory completed?* What changed
+against the note as originally written is recorded at the end of this
+section.
+
+Host-visible sync is a **device timeline** (tickets), not semaphore
+objects.
 
 **The cross-backend primitive is the timeline** — a monotonically
 increasing 64-bit counter that work signals and anyone can wait on or
@@ -343,7 +360,7 @@ Devices*; the ticket model then extends with one primitive
 Metal) would require OS-level external semaphores and are out of
 scope; host-side `wait` + `write` already bridges devices correctly.
 
-Sequencing and contract notes, for whoever builds this:
+Sequencing and contract notes, borne out in the build:
 
 - **Land it with (or after) batching, not before.** Under v1's blocking
   run() every ticket is complete before run() returns — the API would
@@ -360,3 +377,46 @@ Sequencing and contract notes, for whoever builds this:
   semaphore handles, `MTLSharedEvent` export, `cuImportExternalSemaphore`)
   is the one case that would need an exported opaque handle. Separate,
   later decision; nothing in the ticket model forecloses it.
+
+### What the build added to the note
+
+- **The trio is virtual with defaults, not pure.** `submitted()` and
+  `completed()` return 0 and `wait()` does nothing, which is *accurate*
+  for a backend that completes every call before returning. That keeps
+  the stub backends and the mock's storage half conformant without
+  touching them, and makes the ticket API additive for out-of-tree
+  backends. `flush()` (= `wait(submitted())`) is public non-virtual for
+  the same reason `compile()` is: a backend that got the other two right
+  cannot get it wrong.
+- **Deferred release is the second half.** A `Buffer` whose handle dies
+  hands its teardown to a FIFO of closures keyed by ticket, drained
+  oldest-first and stopping at the first that isn't complete. That is
+  what lets a caller destroy a buffer straight after `run()`, and what
+  makes recycled allocation safe — so the contract gained "a fresh
+  buffer's contents are unspecified", which is what pays for it.
+- **Boundedness is one knob, not two mechanisms.** `Options::max_queued`
+  caps outstanding *tickets*, which bounds recorded commands, in-flight
+  submissions and memory awaiting release together, at one stall per
+  `max_queued` dispatches. Bounding *bytes* is a separate concern and
+  belongs to `Options::pool_budget_bytes`.
+- **The allocator is per-backend and off-the-shelf.** Vulkan uses VMA.
+  Nothing about it belongs in the core: CUDA gets the same behaviour
+  from `cudaMallocAsync`/`cudaMemPool_t` (stream-ordered allocation *is*
+  this design, built into the API) and Metal from `MTLHeap`. Do not
+  write a free list.
+- **Batching needs one barrier, and its correctness rests on there being
+  one queue.** A global compute→compute barrier before every dispatch
+  orders it against everything earlier in submission order on that
+  queue — across batch and submission boundaries alike — so no
+  per-buffer tracking is needed. This is exactly the assumption that
+  breaks if a Device ever owns more than one queue; the design-consistent
+  answer there stays "open two Devices".
+- **Verification caveat worth knowing.** Vulkan synchronization
+  validation cannot check that barrier: it tracks hazards through
+  descriptor bindings, and this dialect passes buffers as device
+  addresses in push constants, so it sees no buffer accesses to order.
+  Nor will a chain test catch a missing barrier on MoltenVK, which
+  coalesces dispatches into a Metal encoder that orders them anyway. The
+  barrier rests on the spec argument above; the tests cover chaining,
+  batch boundaries and throttling, which is a different thing and worth
+  not confusing with it.

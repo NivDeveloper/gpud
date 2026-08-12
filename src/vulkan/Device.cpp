@@ -49,6 +49,7 @@ bool has_extension(const std::vector<VkExtensionProperties> &exts,
 std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     Device::State s;
 
+    s.max_queued = opts.max_queued < 1 ? 1 : opts.max_queued;
     s.slangc = find_slangc();
     if (s.slangc.empty()) return log("no slangc"), nullptr;
 
@@ -205,6 +206,18 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     aci.physicalDevice = s.phys;
     aci.device = s.device;
     aci.instance = s.instance;
+
+    // Options::pool_budget_bytes, applied to every heap: the allocator
+    // stops growing there and alloc() reports the pool exhausted rather
+    // than the process quietly ballooning. Must outlive the call below.
+    std::vector<VkDeviceSize> heap_limits;
+    if (opts.pool_budget_bytes != 0) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(s.phys, &mp);
+        heap_limits.assign(mp.memoryHeapCount,
+                           VkDeviceSize(opts.pool_budget_bytes));
+        aci.pHeapSizeLimit = heap_limits.data();
+    }
     // Matches the instance above: claiming a higher version would let VMA
     // reach for entry points this device never loaded.
     aci.vulkanApiVersion = VK_API_VERSION_1_2;
@@ -400,8 +413,8 @@ void Device::throttle_locked(std::unique_lock<std::mutex> &lock) {
     // one stall per max_queued_ dispatches. completed_cache_ was just
     // refreshed by reclaim_locked, so the common path polls nothing.
     const std::uint64_t issued = submitted_.load(std::memory_order_relaxed);
-    if (issued - completed_cache_ < max_queued_) return;
-    wait_locked(lock, issued - max_queued_ + 1);
+    if (issued - completed_cache_ < s.max_queued) return;
+    wait_locked(lock, issued - s.max_queued + 1);
 }
 
 void Device::run(const Kernel &kernel, std::size_t groups,

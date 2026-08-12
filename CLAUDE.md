@@ -6,7 +6,8 @@ the system default compiler (AppleClang). Design rationale:
 docs/design.md; implementation plan: docs/backend-implementation.md.
 Current state: interface + header-only mock + auto-selection + the
 Vulkan backend (implemented: volk-loaded, BDA push-constant ABI,
-slangc do_compile, blocking v1 run; works on MoltenVK with zero
+slangc do_compile, batched submission on a timeline semaphore with
+deferred release and VMA allocation; works on MoltenVK with zero
 Apple-specific code). cuda/metal remain scaffolding stubs (try_open
 returns nullptr).
 
@@ -23,10 +24,22 @@ returns nullptr).
 - **Handles never outlive their Device**, and are only passed back to
   the Device that created them. Buffer/Kernel are move-only.
 - **Ordering contract.** Calls on one Device behave as if executed in
-  call order; read() returns only after every prior run() touching that
-  buffer completed. Backends may batch and sync only at read().
-- **External synchronization (v1).** Calls on one Device are externally
-  synchronized; distinct Devices are independent.
+  call order; any operation on a buffer with queued work synchronizes
+  first — read() *and* write(). Backends may batch and sync only where
+  the host observes.
+- **Device timeline.** submitted()/completed()/wait() expose one
+  monotonic ticket per run(), plus non-virtual flush(). Virtual with
+  defaults meaning "nothing is outstanding", which is accurate for a
+  blocking backend — do not make them pure. The rejected shapes stay
+  rejected: no Signal/Fence objects, no wait/signal lists on run().
+- **Fresh allocations are unspecified.** alloc() may hand back memory a
+  destroyed Buffer owned, so its contents are undefined — write before
+  reading. Conversely a Buffer may be destroyed while work using it is
+  queued; the backend keeps the memory alive. Mock still allocates fresh
+  and zero-filled: it is a test double whose log consumers assert on.
+- **External synchronization, with one carve-out.** Calls on one Device
+  are externally synchronized, except submitted()/completed()/wait(),
+  which are callable from any thread. Distinct Devices are independent.
 - **Positional buffer ABI.** buffers[0] = output, buffers[1+k] = input
   leaf k. No reflection/metadata queries; caller and kernel-source
   generator agree on the order. How a buffer reaches the kernel (BDA
@@ -58,10 +71,12 @@ include/gpud/Vulkan.h      vulkan::try_open declaration only
 src/auto/open_default.cpp  env override + #ifdef GPUD_HAS_* priority chain
 src/{cuda,metal,vulkan}/   backends — the include firewall (SDK types
                            live only here; cuda/metal still stubs):
-  Device.h / Device.cpp      Device subclass; try_open, run, teardown
+  Device.h / Device.cpp      Device subclass; try_open, run, timeline,
+                             batching/deferred release, teardown
   Buffer.h / Buffer.cpp      BufferImpl (: Buffer::Impl) + alloc/write/read
   Kernel.h / Kernel.cpp      KernelImpl (: Kernel::Impl) + do_compile
   CMakeLists.txt             deps: fetch/find per backend, linked PRIVATE
+  (vulkan only) Vma.cpp      VMA_IMPLEMENTATION, alone in its TU
 tests/                     device_test (mock/open_default units),
                            conformance_test (same suite over every
                            backend; real ones skip when try_open fails),
@@ -73,14 +88,32 @@ docs/backend-implementation.md  the plan for implementing backends
 ```
 
 Vulkan specifics worth knowing before touching src/vulkan: no SDK is
-linked — volk (fetched, compiled in) dlopens the loader at runtime, and
+linked — volk (fetched, compiled in) dlopens the loader at runtime,
 headers come from find_package(Vulkan) or a fetched pinned
-Vulkan-Headers; requires driver bufferDeviceAddress (no descriptor-set
-fallback); push data = scalar blob then 8-aligned buffer addresses,
-range fixed at 128 bytes; ~Device must clear_kernels() before
-vkDestroyDevice (base cache destructs after derived dtor); the
+Vulkan-Headers, and VMA is fetched download-only the same way volk is;
+requires driver bufferDeviceAddress (no descriptor-set fallback) and
+timelineSemaphore, both enabled explicitly; push data = scalar blob then
+8-aligned buffer addresses, range fixed at 128 bytes; the
 portability-enumeration/subset handling is generic Khronos portability
 code, NOT MoltenVK-specific — keep it free of platform #ifdefs.
+
+Teardown order in ~Device is load-bearing and easy to get subtly wrong:
+waitIdle → drain deferred releases *unconditionally* (ticket-checked
+would strand entries behind a never-signalled ticket) → clear_kernels()
+(the base cache destructs after the derived dtor, and KernelImpls hold
+pipelines) → vmaDestroyAllocator (after the drain, whose closures call
+vmaDestroyBuffer) → semaphore → command pool → device → instance.
+
+Three more traps in the batching code, all commented in place: the
+throttle must use the internal wait_locked(), never the public wait(),
+which would re-lock a non-recursive mutex; the ticket is claimed only
+after the dispatch is recorded, with the lock never released in between;
+and a failed submit host-signals the timeline, since the tickets were
+already handed out and nothing else would ever signal them. Note that
+synchronization validation cannot verify the compute→compute barrier
+here — it tracks hazards via descriptor bindings and this ABI passes
+device addresses in push constants — so do not treat a clean syncval run
+as evidence about the barrier.
 
 Backend-internal headers (src/*/[A-Z]*.h) are never installed and never
 included from include/gpud/*; they are where SDK types will live. The

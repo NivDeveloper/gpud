@@ -73,8 +73,45 @@ entry.
 
 ### v1 non-goals (unchanged from docs/design.md)
 
-Performance (staging, batching, buffer residency), internal locking,
-streams, capability introspection beyond dialect().
+Staging and buffer residency, streams, capability introspection beyond
+dialect(). (Batching, recycled allocation and a narrow thread-safety
+carve-out are no longer non-goals — see below.)
+
+### Batching, tickets and the allocator (added 0.2, after Vulkan)
+
+Step 4 below says run() may be fully blocking, and that is still the
+right way to *start*. When a backend outgrows it, the three pieces
+arrive together, because they are all the same question — *has the work
+touching this memory completed?*
+
+1. **A timeline**, implementing `submitted`/`completed`/`wait`. Every
+   backend has the primitive (docs/design.md has the table): Vulkan a
+   timeline `VkSemaphore`, Metal an `MTLSharedEvent`, CUDA an in-order
+   stream plus an event per value. Leave the base-class defaults alone
+   until then — they say "nothing is ever outstanding", which is exactly
+   true of a blocking backend.
+2. **Deferred release**: a FIFO of closures keyed by ticket, drained
+   oldest-first and stopping at the first not complete. A Buffer handle
+   may die while queued work still reads its memory; its Impl's
+   destructor hands the teardown here instead of doing it inline. The
+   Device destructor drains *unconditionally* after going idle — a
+   ticket-checked drain strands everything behind a ticket that was
+   never signalled.
+3. **The platform allocator — do not write a free list.** Vulkan uses
+   VMA. CUDA gets this free from `cudaMallocAsync`/`cudaMemPool_t`:
+   stream-ordered allocation is precisely this design, built into the
+   API, so points 2 and 3 largely collapse into the driver. Metal has
+   `MTLHeap`. The allocator is per-backend and must not migrate into the
+   core.
+
+Two things that bit the Vulkan implementation and will bite the next
+one. **Order of operations inside run():** claim the ticket only after
+the dispatch is fully recorded and never drop the lock in between, or a
+concurrent `wait()` can submit a batch promising work that was never
+recorded. **Failed submission:** tickets are handed out at record time,
+so if the submit fails nothing will ever signal them and every later
+wait — teardown included — hangs; signal the timeline from the host
+before rethrowing.
 
 ## Vulkan (first, in full) — IMPLEMENTED as planned
 
@@ -121,15 +158,25 @@ anywhere in src/vulkan.
 
 ### Storage
 
-One VkBuffer per Buffer: usage STORAGE | TRANSFER_SRC | TRANSFER_DST |
-SHADER_DEVICE_ADDRESS; one dedicated allocation, HOST_VISIBLE |
-HOST_COHERENT, allocated with the DEVICE_ADDRESS flag, persistently
-mapped. BufferImpl = { VkBuffer, VkDeviceMemory, void* mapped,
-VkDeviceAddress }. write = memcpy in; read = memcpy out (runs are
-blocking in v1, so read has nothing to wait for yet — it is still THE
-designated sync point when batching lands). No VMA: one allocation per
-buffer is fine at this scale and saves a dependency; unified memory
-(Apple Silicon, iGPUs) makes host-visible storage buffers fast anyway.
+One VkBuffer per Buffer: usage STORAGE | SHADER_DEVICE_ADDRESS,
+HOST_VISIBLE | HOST_COHERENT, persistently mapped. write = memcpy in;
+read = wait out the buffer's last ticket, then memcpy out.
+
+*Superseded (0.2):* this originally used one dedicated
+vkAllocateMemory + vkMapMemory per buffer, on the reasoning that it was
+fine at this scale and saved a dependency. It was not — it cost ~52
+us/MB, and the validation layer's best-practices checks flag every such
+buffer. Allocation now goes through **VMA**, which suballocates from
+large blocks; BufferImpl = { VmaAllocator, VkBuffer, VmaAllocation,
+void* mapped, VkDeviceAddress, last_use ticket }. Two details are
+load-bearing: the allocator needs
+VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT (it is what tags the
+backing memory for BDA), and HOST_VISIBLE|HOST_COHERENT must be
+*required* rather than preferred, or USAGE_AUTO may hand back
+host-cached non-coherent memory that needs flush/invalidate around every
+copy. The zero-fill that used to give mock parity is gone with it: a
+fresh buffer's contents are unspecified, which is what makes recycling
+free.
 
 ### Kernels
 
@@ -150,18 +197,40 @@ Push-data ABI (the dialect pact): the scalar blob as emitted, then one
 VkDeviceAddress per buffer in positional order. run() asserts
 scalars.size() + 8 * buffers.size() <= 128.
 
-### run (v1: blocking)
+### run (v1: blocking; superseded 0.2)
 
-Reset the shared command buffer → begin → bind pipeline →
+Originally: begin the shared command buffer → bind pipeline →
 vkCmdPushConstants(scalars ⧺ addresses) → vkCmdDispatch(groups, 1, 1)
-→ end → queue submit with the shared fence → wait → reset fence.
-~40 lines, correct by construction. The batching upgrade later only
-touches run/read internals — interface and tests unchanged.
+→ end → submit with the shared fence → wait → reset. ~40 lines, correct
+by construction, and it did prove the batching upgrade "only touches
+run/read internals — interface and tests unchanged".
+
+*Now:* run() records into a lazily-begun batch command buffer and
+returns; submission happens where the host observes. Each dispatch is
+preceded by a **global compute→compute VkMemoryBarrier**
+(SHADER_WRITE → SHADER_READ|SHADER_WRITE). One barrier suffices because
+a barrier's first synchronization scope covers everything earlier in
+submission order *on that queue*, batch boundaries included — which
+holds only because a gpud Device owns exactly one queue. Each batch also
+ends with a compute→host barrier so device writes are available to the
+host domain. Command buffers are recycled through a free list rather
+than freed via the deferred queue, keeping every command-pool touch on
+one code path (pools require external synchronization, and the deferred
+queue can be drained by whichever thread calls wait()).
+
+Note for anyone trying to test that barrier: synchronization validation
+cannot see it. Syncval tracks hazards through descriptor bindings, and
+this dialect passes buffers as device addresses in push constants, so it
+observes no buffer accesses to order. Nor does a dependent-dispatch
+chain catch its absence on MoltenVK, which coalesces dispatches into a
+Metal encoder that orders them regardless.
 
 ### Teardown (~Device, reverse order)
 
-Wait queue idle → destroy cached Kernels' pipelines/layouts (the base
-class map destructs KernelImpls) → pool/fence → device → instance.
+Wait queue idle → drain deferred releases unconditionally → destroy
+cached Kernels' pipelines/layouts (the base class map destructs
+KernelImpls) → VMA allocator (after the drain, whose closures call
+vmaDestroyBuffer) → semaphore → command pool → device → instance.
 Handle destruction order relative to the Device is the caller's
 contract (handles-don't-outlive-device); nothing to do here.
 

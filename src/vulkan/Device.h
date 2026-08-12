@@ -48,6 +48,7 @@ class Device final : public ::gpud::Device {
         VkSemaphore timeline{};  // the device timeline; each batch signals
                                  // the ticket of its last dispatch
         VmaAllocator allocator{};
+        std::uint32_t max_queued{};   // Options::max_queued, clamped to >= 1
         std::string slangc;      // resolved compiler path
     };
 
@@ -125,7 +126,6 @@ class Device final : public ::gpud::Device {
     std::uint64_t last_submitted_ = 0;   // highest ticket actually submitted
     std::uint64_t completed_cache_ = 0;  // last polled completed(), to keep
                                          // the common path off the driver
-    std::uint32_t max_queued_ = 64;      // Options::max_queued (commit 4)
 
     VkCommandBuffer batch_{};            // open for recording, or null
     std::vector<VkCommandBuffer> free_;  // recorded, completed, reusable
