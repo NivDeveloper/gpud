@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -25,6 +26,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -203,6 +205,48 @@ TEST_P(Conformance, TimelineNeverRunsAheadAndSettlesAtFlush) {
     // Waiting past the last ticket issued is a caller error that must
     // return rather than block on a value nothing will ever signal.
     dev.wait(after + 1000);
+}
+
+// The contract's one thread-safety carve-out: submitted(), completed()
+// and wait() may be called from another thread while this one is inside
+// a Device call. Everything the poller observes must still be
+// consistent — each counter non-decreasing, and completed() never ahead
+// of a submitted() sampled afterwards.
+TEST_P(Conformance, TimelineIsSafeToPollFromAnotherThread) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    gpud::Device &dev = *dev_;
+
+    constexpr std::uint32_t N = 4096;
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    const SaxpyScalars sc{1.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &a};
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> samples{0};
+    std::thread poller([&] {
+        std::uint64_t last_completed = 0, last_submitted = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            // completed() first: a submitted() sampled after it can only
+            // have grown, so completed <= submitted must hold.
+            const std::uint64_t c = dev.completed();
+            const std::uint64_t s = dev.submitted();
+            EXPECT_GE(c, last_completed) << "completed() went backwards";
+            EXPECT_GE(s, last_submitted) << "submitted() went backwards";
+            EXPECT_LE(c, s) << "completed() ran ahead of submitted()";
+            last_completed = c;
+            last_submitted = s;
+            samples.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+
+    for (int i = 0; i < 300; ++i) dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    dev.flush();
+
+    stop.store(true, std::memory_order_relaxed);
+    poller.join();
+    EXPECT_GT(samples.load(), 0) << "poller never ran";
 }
 
 // Requirement: a Buffer whose handle dies must not take its memory with
