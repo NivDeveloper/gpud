@@ -14,6 +14,8 @@
 #include <volk.h>
 
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -39,7 +41,7 @@ class Device final : public ::gpud::Device {
         std::uint32_t queue_family{};
         VkCommandPool pool{};
         VkCommandBuffer cmd{};   // one reusable buffer: run() is blocking (v1)
-        VkFence fence{};
+        VkSemaphore timeline{};  // the device timeline; run() signals ticket N
         VkPhysicalDeviceMemoryProperties memory{};
         std::string slangc;      // resolved compiler path
     };
@@ -59,12 +61,37 @@ class Device final : public ::gpud::Device {
              std::span<const std::byte> scalars,
              std::span<Buffer *const> buffers) override;
 
+    // The device timeline, backed by a timeline VkSemaphore (core 1.2).
+    std::uint64_t submitted() const override { return submitted_; }
+    std::uint64_t completed() const override;
+    void wait(std::uint64_t ticket) override;
+
+    // Deferred release. A Buffer handle may die while queued work still
+    // reads its memory, so BufferImpl hands its teardown here instead of
+    // doing it inline: `release` runs once `ticket` has completed, or
+    // right now if it already has.
+    void defer_release(std::uint64_t ticket, std::function<void()> release);
+
   protected:
     // Kernel.cpp
     Kernel do_compile(std::string_view source) override;
 
   private:
+    // Run the deferred releases whose ticket has completed, oldest
+    // first, stopping at the first that hasn't. `force` skips the ticket
+    // test entirely — teardown only, once the device is idle, where
+    // tickets from an unsubmitted batch would never be signalled and
+    // would strand every entry behind them.
+    void drain(bool force);
+
     State s;
+    std::uint64_t submitted_ = 0;
+
+    struct Pending {
+        std::uint64_t ticket;
+        std::function<void()> release;
+    };
+    std::deque<Pending> deferred_;
 };
 
 } // namespace gpud::vulkan

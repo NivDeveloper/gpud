@@ -112,7 +112,9 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     }
 
     // The BDA push-constant ABI needs Vulkan 1.2 + bufferDeviceAddress;
-    // no descriptor-set fallback path — nullptr instead.
+    // no descriptor-set fallback path — nullptr instead. timelineSemaphore
+    // backs the device timeline; it is mandatory in 1.2, so the probe is
+    // belt-and-braces for portability drivers.
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(s.phys, &props);
     if (props.apiVersion < VK_API_VERSION_1_2)
@@ -123,6 +125,7 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     f2.pNext = &f12;
     vkGetPhysicalDeviceFeatures2(s.phys, &f2);
     if (!f12.bufferDeviceAddress) return fail("no bufferDeviceAddress");
+    if (!f12.timelineSemaphore) return fail("no timelineSemaphore");
 
     n = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &n, nullptr);
@@ -155,6 +158,7 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     VkPhysicalDeviceVulkan12Features enable12{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     enable12.bufferDeviceAddress = VK_TRUE;
+    enable12.timelineSemaphore = VK_TRUE;   // core in 1.2, still opt-in
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &enable12;
     dci.queueCreateInfoCount = 1;
@@ -167,7 +171,8 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     vkGetDeviceQueue(s.device, s.queue_family, 0, &s.queue);
     vkGetPhysicalDeviceMemoryProperties(s.phys, &s.memory);
 
-    // One reusable command buffer + fence — run() submits and blocks (v1).
+    // One reusable command buffer — run() submits and blocks (v1) — plus
+    // the timeline semaphore every submission signals.
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = s.queue_family;
@@ -179,10 +184,15 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
     vkAllocateCommandBuffers(s.device, &cai, &s.cmd);
-    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-    if (vkCreateFence(s.device, &fci, nullptr, &s.fence) != VK_SUCCESS) {
+
+    VkSemaphoreTypeCreateInfo stci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    stci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    stci.initialValue = 0;   // ticket 0 = "nothing has ever been queued"
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    sci.pNext = &stci;
+    if (vkCreateSemaphore(s.device, &sci, nullptr, &s.timeline) != VK_SUCCESS) {
         vkDestroyCommandPool(s.device, s.pool, nullptr);
-        return fail("vkCreateFence failed");
+        return fail("vkCreateSemaphore failed");
     }
 
     return std::make_unique<Device>(s);
@@ -190,11 +200,56 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
 
 Device::~Device() {
     vkDeviceWaitIdle(s.device);
+    // Unconditional: the device is idle, so every deferred release is
+    // safe to run regardless of what its ticket says. A ticket-checked
+    // drain here would strand entries behind any ticket the timeline
+    // never reached.
+    drain(true);
     clear_kernels();   // KernelImpls hold pipelines — before the VkDevice
-    vkDestroyFence(s.device, s.fence, nullptr);
+    vkDestroySemaphore(s.device, s.timeline, nullptr);
     vkDestroyCommandPool(s.device, s.pool, nullptr);
     vkDestroyDevice(s.device, nullptr);
     vkDestroyInstance(s.instance, nullptr);
+}
+
+std::uint64_t Device::completed() const {
+    std::uint64_t value = 0;
+    check(vkGetSemaphoreCounterValue(s.device, s.timeline, &value),
+          "vkGetSemaphoreCounterValue");
+    return value;
+}
+
+void Device::wait(std::uint64_t ticket) {
+    // Clamp rather than hang: a ticket beyond the last one issued would
+    // block on a value nothing will ever signal.
+    if (ticket > submitted_) ticket = submitted_;
+    if (ticket != 0 && completed() < ticket) {
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &s.timeline;
+        wi.pValues = &ticket;
+        check(vkWaitSemaphores(s.device, &wi, UINT64_MAX), "vkWaitSemaphores");
+    }
+    drain(false);
+}
+
+void Device::defer_release(std::uint64_t ticket, std::function<void()> release) {
+    if (ticket <= completed()) {
+        release();
+        return;
+    }
+    deferred_.push_back({ticket, std::move(release)});
+}
+
+void Device::drain(bool force) {
+    // Tickets only ever increase, so the queue is ordered and the first
+    // entry that isn't ready means none behind it are either.
+    const std::uint64_t done = force ? 0 : completed();
+    while (!deferred_.empty() &&
+           (force || deferred_.front().ticket <= done)) {
+        deferred_.front().release();
+        deferred_.pop_front();
+    }
 }
 
 void Device::run(const Kernel &kernel, std::size_t groups,
@@ -214,9 +269,9 @@ void Device::run(const Kernel &kernel, std::size_t groups,
     for (std::size_t i = 0; i < buffers.size(); ++i)
         std::memcpy(push + addr_off + 8 * i, &impl_of(*buffers[i]).address, 8);
 
-    // Record + submit + wait. The per-run fence wait is what makes the
-    // ordering contract trivially hold; batching with sync-at-read() is
-    // the planned optimization and only touches this file.
+    // Record + submit + wait. The per-run wait is what makes the ordering
+    // contract trivially hold; batching with sync-at-read() is the
+    // planned optimization and only touches this file.
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     check(vkBeginCommandBuffer(s.cmd, &bi), "vkBeginCommandBuffer");
@@ -226,13 +281,25 @@ void Device::run(const Kernel &kernel, std::size_t groups,
     vkCmdDispatch(s.cmd, std::uint32_t(groups), 1, 1);
     check(vkEndCommandBuffer(s.cmd), "vkEndCommandBuffer");
 
+    // This run's ticket. It is claimed only once the submit succeeded:
+    // a throw before that point leaves the timeline consistent, so a
+    // later wait() can never block on a value nothing will signal.
+    const std::uint64_t ticket = submitted_ + 1;
+    VkTimelineSemaphoreSubmitInfo tssi{
+        VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    tssi.signalSemaphoreValueCount = 1;   // must match signalSemaphoreCount
+    tssi.pSignalSemaphoreValues = &ticket;
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &tssi;
     si.commandBufferCount = 1;
     si.pCommandBuffers = &s.cmd;
-    check(vkQueueSubmit(s.queue, 1, &si, s.fence), "vkQueueSubmit");
-    check(vkWaitForFences(s.device, 1, &s.fence, VK_TRUE, UINT64_MAX),
-          "vkWaitForFences");
-    check(vkResetFences(s.device, 1, &s.fence), "vkResetFences");
+    si.signalSemaphoreCount = 1;
+    si.pSignalSemaphores = &s.timeline;
+    check(vkQueueSubmit(s.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit");
+    submitted_ = ticket;
+    for (Buffer *b : buffers) impl_of(*b).last_use = ticket;
+
+    wait(ticket);
 }
 
 } // namespace gpud::vulkan

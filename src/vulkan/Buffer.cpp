@@ -8,8 +8,25 @@
 
 namespace gpud::vulkan {
 
+BufferImpl::~BufferImpl() {
+    // The handle dies here, but the memory must not while queued work
+    // can still reference it — hand it to the Device, which releases it
+    // once last_use has completed (or immediately, if it already has).
+    // Both destroy calls tolerate a null handle, so a half-built impl
+    // from a throwing alloc() is fine.
+    if (!owner || (!buffer && !memory)) return;
+    owner->defer_release(last_use,
+                         [dev = device, buf = buffer, mem = memory] {
+                             vkDestroyBuffer(dev, buf, nullptr);
+                             vkFreeMemory(dev, mem, nullptr);
+                         });
+}
+
 Buffer Device::alloc(std::size_t bytes) {
+    drain(false);   // reclaim what finished since the last call
+
     auto impl = std::make_unique<BufferImpl>();
+    impl->owner = this;
     impl->device = s.device;
 
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -58,15 +75,23 @@ Buffer Device::alloc(std::size_t bytes) {
 }
 
 void Device::write(Buffer &dst, const void *src, std::size_t bytes) {
+    // Overwriting storage a queued dispatch still reads is a hazard the
+    // caller cannot see, so an operation on a buffer with queued work
+    // synchronizes first (contract note 1).
     assert(bytes <= dst.bytes());
-    std::memcpy(impl_of(dst).mapped, src, bytes);
+    BufferImpl &b = impl_of(dst);
+    wait(b.last_use);
+    std::memcpy(b.mapped, src, bytes);
 }
 
 void Device::read(const Buffer &src, void *dst, std::size_t bytes) {
-    // The designated sync point. run() already blocked (v1), and the
-    // memory is host-coherent, so a plain copy is complete and correct.
+    // The designated sync point: wait out the last dispatch that touched
+    // this buffer, then copy. The memory is host-coherent, so once that
+    // work is done a plain memcpy is complete and correct.
     assert(bytes <= src.bytes());
-    std::memcpy(dst, impl_of(src).mapped, bytes);
+    BufferImpl &b = impl_of(src);
+    wait(b.last_use);
+    std::memcpy(dst, b.mapped, bytes);
 }
 
 } // namespace gpud::vulkan

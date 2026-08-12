@@ -14,6 +14,7 @@
 #include "Device.h"
 
 #include <cassert>
+#include <cstdint>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -85,6 +86,20 @@ class Device final : public ::gpud::Device {
         r.scalars.assign(scalars.begin(), scalars.end());
         for (Buffer *b : buffers) r.buffers.push_back(id(*b));
         log.runs.push_back(std::move(r));
+        ++ticket_;
+    }
+
+    // The timeline, mock-style: run() ticks the counter and the work is
+    // done by the time run() returns, so completed() == submitted() and
+    // wait() has nothing to wait for. Consumers can exercise their
+    // ticket bookkeeping against this without a GPU.
+    std::uint64_t submitted() const override { return ticket_; }
+    std::uint64_t completed() const override { return ticket_; }
+    void wait(std::uint64_t ticket) override {
+        // Debug-only, and compiled out of the default Release build:
+        // tests must not depend on it firing.
+        assert(ticket <= ticket_ && "waiting on an unissued ticket");
+        (void)ticket;
     }
 
   protected:
@@ -109,6 +124,7 @@ class Device final : public ::gpud::Device {
     }
 
     int next_buffer_id_ = 0;
+    std::uint64_t ticket_ = 0;
 };
 
 inline std::unique_ptr<::gpud::Device> try_open(const Options & = {}) {

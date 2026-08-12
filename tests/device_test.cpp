@@ -12,6 +12,7 @@ static_assert(GPUD_VERSION_MAJOR >= 0 && sizeof(gpud::version) > 1,
               "generated Version.h is coherent");
 
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -120,6 +121,36 @@ TEST(MockDevice, RunRecordsGroupsScalarsAndPositionalBuffers) {
     EXPECT_EQ(run.buffers, want);
     EXPECT_NE(want[0], want[1]);   // distinct buffers, distinct ids
     EXPECT_NE(want[1], want[2]);
+}
+
+TEST(MockDevice, TimelineTicksOncePerRun) {
+    gpud::mock::Device mock;
+    gpud::Device &dev = mock;
+
+    EXPECT_EQ(dev.submitted(), 0u);
+    EXPECT_EQ(dev.completed(), 0u);
+
+    gpud::Buffer out = dev.alloc(16);
+    static constexpr char source[] = "__kernel__ noop(out)";
+    const gpud::Kernel &kernel = dev.compile(source);
+    gpud::Buffer *buffers[] = {&out};
+
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+        dev.run(kernel, 1, {}, buffers);
+        EXPECT_EQ(dev.submitted(), i);
+        EXPECT_EQ(dev.completed(), i);   // the mock finishes inline
+    }
+
+    dev.flush();   // nothing to wait for, and it enqueues nothing
+    EXPECT_EQ(dev.completed(), dev.submitted());
+    EXPECT_EQ(dev.submitted(), 3u);
+
+    // Storage operations do not occupy a tick — only run() does.
+    const std::array<std::byte, 16> src{};
+    dev.write(out, src.data(), src.size());
+    std::array<std::byte, 16> dst{};
+    dev.read(out, dst.data(), dst.size());
+    EXPECT_EQ(dev.submitted(), 3u);
 }
 
 TEST(OpenDefault, HonorsGpudBackendMock) {

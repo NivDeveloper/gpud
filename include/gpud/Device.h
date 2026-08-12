@@ -40,6 +40,7 @@
 //     errors carry the compiler diagnostics verbatim.
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -141,6 +142,32 @@ class Device {
     virtual void run(const Kernel &kernel, std::size_t groups,
                      std::span<const std::byte> scalars,
                      std::span<Buffer *const> buffers) = 0;
+
+    // ── the device timeline ──────────────────────────────────────────
+    // Every run() occupies one tick of a monotonically increasing 64-bit
+    // counter, in call order. Tickets refine the ordering contract
+    // rather than replacing it: read() still means what it always did,
+    // and is internally "wait(last ticket touching this buffer) + copy".
+    // Values are never reused, so the scheme is race-free by
+    // construction.
+    //
+    // The defaults below describe a backend that completes every call
+    // before returning (mock's storage half, the stub backends): such a
+    // device never has outstanding work, so a timeline pinned at zero is
+    // accurate. Backends that queue work override all three.
+    //
+    // submitted()/completed() poll and never block; wait() blocks until
+    // the ticket has completed. Waiting on a ticket beyond submitted()
+    // is a caller error and returns immediately rather than hanging.
+
+    virtual std::uint64_t submitted() const { return 0; }   // last enqueued
+    virtual std::uint64_t completed() const { return 0; }   // highest done
+    virtual void wait(std::uint64_t /*ticket*/) {}
+
+    // Block until everything enqueued so far has completed. Non-virtual:
+    // it is exactly wait(submitted()), and a backend that got those two
+    // right cannot get this wrong.
+    void flush() { wait(submitted()); }
 
   protected:
     virtual Kernel do_compile(std::string_view source) = 0;

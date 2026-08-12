@@ -7,24 +7,30 @@
 
 #include <volk.h>
 
+#include <cstdint>
+
 namespace gpud::vulkan {
+
+class Device;   // ~BufferImpl defers its teardown to the owning Device
 
 // Host-visible, host-coherent, persistently mapped storage buffer with
 // a device address (the BDA push-constant ABI). Simple and — on unified
 // memory (Apple Silicon, iGPUs) — fast; staging is a post-v1 concern.
 struct BufferImpl final : ::gpud::Buffer::Impl {
+    Device *owner{};     // non-owning; the Device that allocated this
     VkDevice device{};   // non-owning, for destruction
     VkBuffer buffer{};
     VkDeviceMemory memory{};
     void *mapped{};
     VkDeviceAddress address{};
 
-    ~BufferImpl() override {
-        // Runs before the Device dies (handle-lifetime rule). Freeing
-        // the memory unmaps it implicitly.
-        if (buffer) vkDestroyBuffer(device, buffer, nullptr);
-        if (memory) vkFreeMemory(device, memory, nullptr);
-    }
+    // Ticket of the most recent run() that referenced this buffer; 0 =
+    // never used by a dispatch. This is the "has the work touching this
+    // memory completed?" key — for read()/write() hazards and for how
+    // long the memory must outlive the handle.
+    std::uint64_t last_use = 0;
+
+    ~BufferImpl() override;   // Buffer.cpp
 };
 
 inline BufferImpl &impl_of(const ::gpud::Buffer &b) {
