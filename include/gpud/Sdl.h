@@ -24,16 +24,6 @@ namespace gpud::sdl {
 // consumers whose code generators emit that dialect.
 std::unique_ptr<::gpud::Device> try_open(const Options & = {});
 
-// ADOPT an externally created device (the app-owns-the-device shape: a
-// renderer creates it, gpud computes on it). Non-owning — teardown
-// releases gpud's kernels and buffers but never destroys the device,
-// which must outlive the returned Device. The device must support the
-// SPIR-V shader format (nullptr otherwise, GPUD_LOG says so; the
-// planned MSL dialect lifts this). Options::device_index is ignored —
-// the device is given.
-std::unique_ptr<::gpud::Device> try_open_on(SDL_GPUDevice *,
-                                            const Options & = {});
-
 // The visualizer seam: the SAME SDL_GPUDevice the compute runs on (a
 // renderer claims a window on it and shares the queue), and a buffer's
 // native object (bind it as a graphics storage read — allocations

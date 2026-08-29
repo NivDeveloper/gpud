@@ -69,37 +69,13 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     return std::make_unique<Device>(s);
 }
 
-std::unique_ptr<::gpud::Device> try_open_on(SDL_GPUDevice *dev,
-                                            const Options &) {
-    Device::State s;
-    s.owned = false;
-
-    if (!dev)
-        return log("adopt: null device"), nullptr;
-
-    // Init is refcounted and SYMMETRIC with ~Device's quit, so teardown
-    // stays one path whether the device was created or adopted.
-    if (!SDL_InitSubSystem(SDL_INIT_VIDEO))
-        return log(SDL_GetError()), nullptr;
-
-    // The one probe the creating path gets for free: this backend emits
-    // SPIR-V, so the adopted device must accept it.
-    if (!(SDL_GetGPUShaderFormats(dev) & SDL_GPU_SHADERFORMAT_SPIRV)) {
-        log("adopt: device does not accept SPIR-V shaders");
-        SDL_QuitSubSystem(SDL_INIT_VIDEO);
-        return nullptr;
-    }
-    s.dev = dev;
-    return std::make_unique<Device>(s);
-}
 
 Device::~Device() {
     // Blocking run() leaves nothing in flight, but a driver may hold
     // internal work; idle before releasing anything.
     SDL_WaitForGPUIdle(s_.dev);
     clear_kernels(); // KernelImpls hold pipelines — before the device
-    if (s_.owned)
-        SDL_DestroyGPUDevice(s_.dev);
+    SDL_DestroyGPUDevice(s_.dev);
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 

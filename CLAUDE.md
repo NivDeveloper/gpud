@@ -9,10 +9,11 @@ implemented backends. Vulkan: volk-loaded, BDA push-constant ABI
 ("slang-vulkan"), slangc do_compile, batched submission on a timeline
 semaphore with deferred release and VMA allocation; works on MoltenVK
 with zero Apple-specific code. SDL_GPU: slot-bound ABI ("slang-slot"),
-slangc → SPIR-V, fully blocking v1 (base timeline defaults), native
-SDL_GPUDevice/SDL_GPUBuffer handle export for renderer sharing, and
-try_open_on(SDL_GPUDevice*) to ADOPT an app-created device
-(non-owning; the device must accept SPIR-V).
+slangc → SPIR-V resolved lazily at first compile (bring-up needs no
+toolchain), fully blocking v1 (base timeline defaults), native
+SDL_GPUDevice/SDL_GPUBuffer handle export for renderer sharing;
+BufferSource + the source_of ADL protocol (Device.h) are the
+pull-model interchange vocabulary.
 cuda/metal remain scaffolding stubs (try_open returns nullptr).
 
 ## Invariants (do not break)
@@ -118,7 +119,7 @@ wait per run/write/read; the base timeline defaults are then correct —
 do not override them until batching lands); try_open points
 SDL_VULKAN_LIBRARY at a /usr/local or /opt/homebrew loader when unset
 (SDL dlopens by bare name and misses /usr/local/lib; a user's env
-wins) — an app CREATING the device for try_open_on must do the same; SDL_InitSubSystem/SDL_QuitSubSystem are ref-counted and paired
+wins); SDL_InitSubSystem/SDL_QuitSubSystem are ref-counted and paired
 inside the Device's lifetime — the RAII reading of "no library
 init/shutdown". Native-Metal MSL is the planned phase 2 (slang
 -target metal; the entry-naming and set→argument-table mapping risks

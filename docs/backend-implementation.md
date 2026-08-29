@@ -269,16 +269,14 @@ in auto-selection — native backends first.
   and read), so the base timeline defaults stand and buffer teardown
   releases immediately. Batching = fences ring + tickets, the vulkan
   shape, when a consumer's frame loop needs it.
-- try_open probes: slangc (same three paths), SDL_InitSubSystem
-  (ref-counted, paired in ~Device), the SDL_VULKAN_LIBRARY hint filled
-  from /usr/local//opt/homebrew when unset (SDL dlopens the loader by
-  bare name and misses /usr/local/lib on macOS; env wins), then
-  SDL_CreateGPUDevice(SPIRV).
-- `try_open_on(SDL_GPUDevice*)` ADOPTS an app-created device — the
-  "app decides devices, libraries adopt" shape a renderer sharing the
-  device wants. Non-owning teardown (releases gpud's resources, never
-  the device); refuses a device without SPIR-V support; the creating
-  app owns the Vulkan-loader hint.
+- try_open probes: SDL_InitSubSystem (ref-counted, paired in
+  ~Device), the SDL_VULKAN_LIBRARY hint filled from
+  /usr/local//opt/homebrew when unset (SDL dlopens the loader by bare
+  name and misses /usr/local/lib on macOS; env wins), then
+  SDL_CreateGPUDevice(SPIRV). slangc is NOT probed at open — it
+  resolves lazily at the first do_compile and a missing one throws
+  there, so a consumer that only shares the device (a renderer with
+  committed bytecode) needs no shader toolchain.
 - The public header carve-out: `include/gpud/Sdl.h` forward-declares
   SDL_GPUDevice/SDL_GPUBuffer (no include) for native_device /
   native_buffer — the ONE deliberate exception to the no-SDK-names

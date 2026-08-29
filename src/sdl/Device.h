@@ -22,7 +22,6 @@ class Device final : public ::gpud::Device {
     struct State {
         SDL_GPUDevice *dev = nullptr;
         std::string slangc;
-        bool owned = true; // adopted devices are never destroyed here
     };
     explicit Device(const State &s) : s_(s) {}
     ~Device() override;
