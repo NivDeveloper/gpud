@@ -114,6 +114,19 @@ class Buffer {
     std::size_t bytes_ = 0;
 };
 
+// The pull-model interchange: where a logical array currently lives.
+// A producer library advertises a type P as a producer by an
+// ADL-findable `gpud::BufferSource source_of(const P &)`; a consumer
+// calls current() at the moment of use. nullptr means nothing is
+// resident right now — consumers skip, they do not fail. The source is
+// valid while the producer object lives at its address; the returned
+// Buffer obeys the normal handle rules (same Device, do not outlive it).
+struct BufferSource {
+    Buffer *(*fn)(void *) = nullptr;
+    void *user = nullptr;
+    Buffer *current() const { return fn(user); }
+};
+
 // Move-only RAII handle to a compiled kernel. Same rules as Buffer.
 class Kernel {
   public:
