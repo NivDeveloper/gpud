@@ -239,6 +239,50 @@ contract (handles-don't-outlive-device); nothing to do here.
 ~450 lines across the existing six files; bring-up (Device.cpp) is the
 bulk. No new files needed beyond what's scaffolded.
 
+## SDL_GPU — IMPLEMENTED (v1, blocking)
+
+The portability-layer backend, and the renderer seam: a consumer can
+claim a window on the exported native SDL_GPUDevice and read compute
+buffers zero-copy (allocations carry GRAPHICS_STORAGE_READ). Sits LAST
+in auto-selection — native backends first.
+
+- Dependency tier: found, never fetched (`find_package(SDL3 CONFIG)`;
+  a system package or a prefix on CMAKE_PREFIX_PATH). SDL is not a
+  small redistributable, so the volk-style pinned fallback does not
+  apply.
+- dialect "slang-slot": numbered `[[vk::binding(k, set)]]` resources —
+  read-only storage buffers dense from 0 in set 0, ONE read-write
+  output at (0, 1), at most one uniform block `ConstantBuffer<Scalars>`
+  at (0, 2) — which is SDL's documented SPIR-V compute convention.
+  run(): scalars via SDL_PushGPUComputeUniformData slot 0, buffers[0]
+  as the pass's read-write binding, buffers[1+k] bound read-only at
+  slot k. std140 for a struct of 4-byte scalars equals the natural
+  packing consumers already use, so the one blob serves both Slang
+  dialects.
+- do_compile: the vulkan backend's slangc invocation verbatim (the
+  binding decorations are in the source), then a SOURCE-TEXT SCAN for
+  the declared resource counts and [numthreads(...)] — SDL declares
+  both at pipeline creation and gpud carries no reflection. Legitimate
+  only because the dialect is self-describing; the scan is part of the
+  dialect pact.
+- v1 execution is FULLY BLOCKING (submit + fence wait in run, write
+  and read), so the base timeline defaults stand and buffer teardown
+  releases immediately. Batching = fences ring + tickets, the vulkan
+  shape, when a consumer's frame loop needs it.
+- try_open probes: slangc (same three paths), SDL_InitSubSystem
+  (ref-counted, paired in ~Device), the SDL_VULKAN_LIBRARY hint filled
+  from /usr/local//opt/homebrew when unset (SDL dlopens the loader by
+  bare name and misses /usr/local/lib on macOS; env wins), then
+  SDL_CreateGPUDevice(SPIRV).
+- The public header carve-out: `include/gpud/Sdl.h` forward-declares
+  SDL_GPUDevice/SDL_GPUBuffer (no include) for native_device /
+  native_buffer — the ONE deliberate exception to the no-SDK-names
+  rule, because the renderer seam is the backend's purpose.
+- Phase 2, recorded: native MSL via slang -target metal +
+  SDL_GPU_SHADERFORMAT_MSL, choosing the target from
+  SDL_GetGPUShaderFormats — the entry-naming (MSL reserves `main`) and
+  set→argument-table mapping risks live there.
+
 ## Metal (same template, later)
 
 - Build deps: none to fetch or find — frameworks ship with Xcode/CLT;

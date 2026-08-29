@@ -152,6 +152,7 @@ kernels". Deliberately excluded:
 | Vulkan  | slangc → SPIR-V → pipeline   | push constants | BDA addresses appended to push data  |
 | Metal   | slang `-target metal` → PSO  | `setBytes`     | `setBuffer(k)` positional            |
 | CUDA    | NVRTC / slang → PTX          | kernel params  | device pointers as params            |
+| SDL_GPU | slangc → SPIR-V → pipeline   | uniform slot 0 | numbered storage-buffer slots        |
 | Mock    | records the call             | records the call | records the call                   |
 
 The mock backend is the test double: consumers exercise their GPU glue

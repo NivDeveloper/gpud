@@ -6,8 +6,11 @@ are separate static libraries; your code never sees an SDK header, and
 there is no global state — you open a `Device` and everything dies with it.
 
 **Status: early.** The interface, a mock backend for testing,
-auto-selection, and the **Vulkan backend** work (macOS included, via
-MoltenVK). CUDA and Metal are unimplemented stubs.
+auto-selection, the **Vulkan backend** (macOS included, via MoltenVK)
+and the **SDL_GPU backend** work. CUDA and Metal are unimplemented
+stubs. The SDL backend consumes slot-bound Slang ("slang-slot") and
+exports its native SDL_GPUDevice/SDL_GPUBuffer handles, so a renderer
+can share the device and read compute buffers zero-copy.
 
 ## Build
 
@@ -22,12 +25,17 @@ Needs CMake ≥ 3.24 and any C++20 compiler — nothing else: the Vulkan
 backend fetches its build dependencies (Khronos headers, volk) and
 never links a Vulkan SDK. It builds by default where Vulkan dev files
 exist; force it anywhere with `-DGPUD_BACKEND_VULKAN=ON` (`_METAL` /
-`_CUDA` exist too, OFF while they are stubs).
+`_CUDA` exist too, OFF while they are stubs). The SDL backend builds
+where SDL3's CMake package is findable (a system install, or a prefix
+on `CMAKE_PREFIX_PATH`) — found, never fetched.
 
 **Running** on the GPU needs a Vulkan ≥ 1.2 driver with
 buffer-device-address (macOS: `brew install molten-vk`) and `slangc`
 on PATH; without them `try_open()`/`open_default()` just return null
-(`GPUD_LOG=1` explains why).
+(`GPUD_LOG=1` explains why). The SDL backend needs the same slangc
+plus an SDL_GPU driver accepting SPIR-V (its Vulkan driver — try_open
+points SDL at a /usr/local or /opt/homebrew loader when the
+`SDL_VULKAN_LIBRARY` env is unset).
 
 ## Use in a project
 

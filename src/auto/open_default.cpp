@@ -1,7 +1,7 @@
 // Backend availability is baked in at THIS target's build time via the
 // GPUD_HAS_* defines. Adding a backend is one #ifdef block in each of
 // the two chains below (plus its include) — keep priority native-first:
-// CUDA, then Metal, then Vulkan.
+// CUDA, then Metal, then Vulkan; the SDL portability layer goes last.
 
 #include <gpud/Auto.h>
 #include <gpud/Mock.h>
@@ -14,6 +14,9 @@
 #endif
 #ifdef GPUD_HAS_VULKAN
 #include <gpud/Vulkan.h>
+#endif
+#ifdef GPUD_HAS_SDL
+#include <gpud/Sdl.h>
 #endif
 
 #include <cstdlib>
@@ -35,6 +38,9 @@ std::unique_ptr<Device> open_default() {
 #ifdef GPUD_HAS_VULKAN
         if (want == "vulkan") return vulkan::try_open();
 #endif
+#ifdef GPUD_HAS_SDL
+        if (want == "sdl") return sdl::try_open();
+#endif
         return nullptr;   // named backend unknown or not compiled in
     }
 
@@ -48,6 +54,9 @@ std::unique_ptr<Device> open_default() {
 #endif
 #ifdef GPUD_HAS_VULKAN
     if (auto d = vulkan::try_open()) return d;
+#endif
+#ifdef GPUD_HAS_SDL
+    if (auto d = sdl::try_open()) return d;
 #endif
     return nullptr;
 }

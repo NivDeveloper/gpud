@@ -26,6 +26,17 @@ option(GPUD_BACKEND_VULKAN "Build the Vulkan backend" ${GPUD_VULKAN_DEFAULT})
 option(GPUD_BACKEND_METAL "Build the Metal backend" OFF)
 option(GPUD_BACKEND_CUDA "Build the CUDA backend" OFF)
 
+# SDL_GPU is implemented; it defaults ON where SDL3's CMake package is
+# findable (system package or CMAKE_PREFIX_PATH). find-only, no
+# FetchContent fallback: SDL is not a small redistributable.
+find_package(SDL3 QUIET CONFIG)
+if(SDL3_FOUND)
+  set(GPUD_SDL_DEFAULT ON)
+else()
+  set(GPUD_SDL_DEFAULT OFF)
+endif()
+option(GPUD_BACKEND_SDL "Build the SDL_GPU backend" ${GPUD_SDL_DEFAULT})
+
 # ── core: the dependency-free interface ─────────────────────────────────
 # <gpud/Version.h> is generated into the build tree from the project
 # version above — bumping the version means editing project() only.
@@ -75,6 +86,11 @@ if(GPUD_BACKEND_VULKAN)
   add_subdirectory(src/vulkan)   # gpud_vulkan + alias gpud::vulkan
   target_compile_definitions(gpud_auto PUBLIC GPUD_HAS_VULKAN)
   target_link_libraries(gpud_auto PRIVATE gpud::vulkan)
+endif()
+if(GPUD_BACKEND_SDL)
+  add_subdirectory(src/sdl)      # gpud_sdl + alias gpud::sdl
+  target_compile_definitions(gpud_auto PUBLIC GPUD_HAS_SDL)
+  target_link_libraries(gpud_auto PRIVATE gpud::sdl)
 endif()
 
 if(GPUD_BUILD_TESTS)

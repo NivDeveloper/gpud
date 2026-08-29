@@ -13,6 +13,9 @@
 #ifdef GPUD_HAS_VULKAN
 #include <gpud/Vulkan.h>
 #endif
+#ifdef GPUD_HAS_SDL
+#include <gpud/Sdl.h>
+#endif
 
 #include <gtest/gtest.h>
 
@@ -68,10 +71,38 @@ void main(uint3 tid : SV_DispatchThreadID) {
 )";
 #endif
 
+#ifdef GPUD_HAS_SDL
+// Mirrors the shape consumers' code generators emit for "slang-slot":
+// numbered [[vk::binding]] resources, scalars behind a ConstantBuffer.
+// std140 for a struct of 4-byte scalars matches SaxpyScalars' natural
+// layout, so the one scalar blob serves both dialects.
+constexpr char sdl_saxpy[] = R"(
+struct Scalars {
+  float s0;
+  uint s1;
+};
+[[vk::binding(0, 2)]] ConstantBuffer<Scalars> sc;
+[[vk::binding(0, 1)]] RWStructuredBuffer<float> out_buf;
+[[vk::binding(0, 0)]] StructuredBuffer<float> in0;
+[[vk::binding(1, 0)]] StructuredBuffer<float> in1;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+  uint i = tid.x;
+  if (i >= sc.s1) return;
+  out_buf[i] = in0[i] + sc.s0 * in1[i];
+}
+)";
+#endif
+
 const Backend kBackends[] = {
     {"mock", [] { return gpud::mock::try_open(); }, nullptr},
 #ifdef GPUD_HAS_VULKAN
     {"vulkan", [] { return gpud::vulkan::try_open(); }, vulkan_saxpy},
+#endif
+#ifdef GPUD_HAS_SDL
+    {"sdl", [] { return gpud::sdl::try_open(); }, sdl_saxpy},
 #endif
 };
 
@@ -420,3 +451,23 @@ TEST_P(Conformance, BadKernelThrowsWithDiagnostics) {
 }
 
 } // namespace
+
+#ifdef GPUD_HAS_SDL
+#include <SDL3/SDL.h>
+
+// The visualizer seam: the native handles are live SDL objects on the
+// very device the compute runs on; a foreign Device yields nullptr.
+TEST(SdlInterop, NativeHandlesAreLive) {
+    auto dev = gpud::sdl::try_open();
+    if (!dev) GTEST_SKIP() << "sdl: try_open returned nullptr on this machine";
+    SDL_GPUDevice *nd = gpud::sdl::native_device(*dev);
+    ASSERT_NE(nd, nullptr);
+    EXPECT_NE(SDL_GetGPUShaderFormats(nd) & SDL_GPU_SHADERFORMAT_SPIRV, 0u);
+
+    gpud::Buffer buf = dev->alloc(64);
+    EXPECT_NE(gpud::sdl::native_buffer(buf), nullptr);
+
+    auto foreign = gpud::mock::try_open();
+    EXPECT_EQ(gpud::sdl::native_device(*foreign), nullptr);
+}
+#endif

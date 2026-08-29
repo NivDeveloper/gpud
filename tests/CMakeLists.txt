@@ -23,6 +23,11 @@ target_link_libraries(gpud_tests PRIVATE gpud::mock gpud::auto_ GTest::gtest_mai
 if(GPUD_BACKEND_VULKAN)
   target_link_libraries(gpud_tests PRIVATE gpud::vulkan)
 endif()
+if(GPUD_BACKEND_SDL)
+  # SDL3 itself too: the interop test makes one real SDL call on the
+  # exported native handle.
+  target_link_libraries(gpud_tests PRIVATE gpud::sdl SDL3::SDL3)
+endif()
 set_target_properties(gpud_tests PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 target_compile_options(gpud_tests PRIVATE -Wall -Wextra)

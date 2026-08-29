@@ -4,12 +4,14 @@ Minimal GPU compute abstraction. Namespace `gpud`; plain C++20
 (std::span is the floor — no C++23/26, no reflection); must build with
 the system default compiler (AppleClang). Design rationale:
 docs/design.md; implementation plan: docs/backend-implementation.md.
-Current state: interface + header-only mock + auto-selection + the
-Vulkan backend (implemented: volk-loaded, BDA push-constant ABI,
-slangc do_compile, batched submission on a timeline semaphore with
-deferred release and VMA allocation; works on MoltenVK with zero
-Apple-specific code). cuda/metal remain scaffolding stubs (try_open
-returns nullptr).
+Current state: interface + header-only mock + auto-selection + TWO
+implemented backends. Vulkan: volk-loaded, BDA push-constant ABI
+("slang-vulkan"), slangc do_compile, batched submission on a timeline
+semaphore with deferred release and VMA allocation; works on MoltenVK
+with zero Apple-specific code. SDL_GPU: slot-bound ABI ("slang-slot"),
+slangc → SPIR-V, fully blocking v1 (base timeline defaults), native
+SDL_GPUDevice/SDL_GPUBuffer handle export for renderer sharing.
+cuda/metal remain scaffolding stubs (try_open returns nullptr).
 
 ## Invariants (do not break)
 
@@ -68,8 +70,11 @@ include/gpud/Auto.h        open_default() declaration
 include/gpud/Cuda.h        cuda::try_open declaration only — never SDK types
 include/gpud/Metal.h       metal::try_open declaration only
 include/gpud/Vulkan.h      vulkan::try_open declaration only
+include/gpud/Sdl.h         sdl::try_open + native_device/native_buffer —
+                           the ONE header naming SDK types (two forward
+                           declarations, no include): the renderer seam
 src/auto/open_default.cpp  env override + #ifdef GPUD_HAS_* priority chain
-src/{cuda,metal,vulkan}/   backends — the include firewall (SDK types
+src/{cuda,metal,vulkan,sdl}/  backends — the include firewall (SDK types
                            live only here; cuda/metal still stubs):
   Device.h / Device.cpp      Device subclass; try_open, run, timeline,
                              batching/deferred release, teardown
@@ -96,6 +101,26 @@ timelineSemaphore, both enabled explicitly; push data = scalar blob then
 8-aligned buffer addresses, range fixed at 128 bytes; the
 portability-enumeration/subset handling is generic Khronos portability
 code, NOT MoltenVK-specific — keep it free of platform #ifdefs.
+
+SDL specifics worth knowing before touching src/sdl: SDL3 is found,
+never fetched (system package or CMAKE_PREFIX_PATH — this machine:
+`CMAKE_PREFIX_PATH=~/Projects/toolchains/sdl3 make`); the dialect is
+"slang-slot" (numbered [[vk::binding]] resources — read-only storage
+set 0, read-write set 1, uniforms set 2, exactly SDL's SPIR-V compute
+convention — scalars behind a named ConstantBuffer); SDL declares a
+pipeline's resource counts and threadgroup size at creation and gpud
+carries no reflection, so do_compile SCANS THE SOURCE for its
+declarations — legitimate only because the dialect is self-describing,
+and part of the dialect pact; v1 is fully blocking (submit + fence
+wait per run/write/read; the base timeline defaults are then correct —
+do not override them until batching lands); try_open points
+SDL_VULKAN_LIBRARY at a /usr/local or /opt/homebrew loader when unset
+(SDL dlopens by bare name and misses /usr/local/lib; a user's env
+wins); SDL_InitSubSystem/SDL_QuitSubSystem are ref-counted and paired
+inside the Device's lifetime — the RAII reading of "no library
+init/shutdown". Native-Metal MSL is the planned phase 2 (slang
+-target metal; the entry-naming and set→argument-table mapping risks
+live there).
 
 Teardown order in ~Device is load-bearing and easy to get subtly wrong:
 waitIdle → drain deferred releases *unconditionally* (ticket-checked
@@ -162,7 +187,7 @@ Tests fetch googletest via FetchContent (needs network on first
 configure). tests/device_h_standalone.cpp is a build-time check that
 Device.h compiles alone under -std=c++20.
 
-## Implementing a backend (metal/cuda; vulkan is the worked reference)
+## Implementing a backend (metal/cuda; vulkan and sdl are the worked references)
 
 Follow docs/backend-implementation.md and mirror src/vulkan. The
 scaffolding already exists: factory header, the src/ dir with class
