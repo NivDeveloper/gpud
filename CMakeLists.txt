@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(gpud VERSION 0.2.0 LANGUAGES CXX
+project(gpud VERSION 0.3.0 LANGUAGES CXX
         DESCRIPTION "Minimal GPU compute abstraction: five operations behind one virtual interface")
 
 option(GPUD_BUILD_TESTS "Build gpud tests" ${PROJECT_IS_TOP_LEVEL})
