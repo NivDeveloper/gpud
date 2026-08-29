@@ -10,7 +10,9 @@ auto-selection, the **Vulkan backend** (macOS included, via MoltenVK)
 and the **SDL_GPU backend** work. CUDA and Metal are unimplemented
 stubs. The SDL backend consumes slot-bound Slang ("slang-slot") and
 exports its native SDL_GPUDevice/SDL_GPUBuffer handles, so a renderer
-can share the device and read compute buffers zero-copy.
+can share the device and read compute buffers zero-copy — in either
+direction: `sdl::try_open()` creates the device, or
+`sdl::try_open_on(dev)` adopts one the app created.
 
 ## Build
 

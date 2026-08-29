@@ -470,4 +470,62 @@ TEST(SdlInterop, NativeHandlesAreLive) {
     auto foreign = gpud::mock::try_open();
     EXPECT_EQ(gpud::sdl::native_device(*foreign), nullptr);
 }
+
+// The adopt shape: the app creates the device, gpud computes on it and
+// never owns it. The saxpy proves compute works end to end on the
+// foreign device; the teardown order proves non-ownership.
+TEST(SdlAdopt, RunsOnAForeignDevice) {
+    SDL_InitSubSystem(SDL_INIT_VIDEO);
+    // The app-side half of the bargain: whoever CREATES the device must
+    // point SDL at a Vulkan loader (SDL dlopens by bare name and misses
+    // /usr/local/lib on macOS) — exactly what a real app will do.
+    if (!SDL_GetHint(SDL_HINT_VULKAN_LIBRARY))
+        SDL_SetHint(SDL_HINT_VULKAN_LIBRARY,
+                    "/usr/local/lib/libvulkan.1.dylib");
+    SDL_GPUDevice *native =
+        SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_SPIRV, false, nullptr);
+    if (!native)
+        GTEST_SKIP() << "no SPIR-V capable SDL_GPU driver on this machine";
+
+    {
+        auto dev = gpud::sdl::try_open_on(native);
+        ASSERT_NE(dev, nullptr);
+        EXPECT_EQ(dev->dialect(), "slang-slot");
+        EXPECT_EQ(gpud::sdl::native_device(*dev), native);
+
+        constexpr std::size_t N = 100;
+        std::vector<float> a(N), b(N), out(N, 0.0f);
+        for (std::size_t i = 0; i < N; ++i)
+            a[i] = float(i), b[i] = 2.0f * float(i);
+        gpud::Buffer ba = dev->alloc(N * 4), bb = dev->alloc(N * 4),
+                     bo = dev->alloc(N * 4);
+        dev->write(ba, a.data(), N * 4);
+        dev->write(bb, b.data(), N * 4);
+        const gpud::Kernel &k = dev->compile(sdl_saxpy);
+        const SaxpyScalars sc{2.5f, N};
+        gpud::Buffer *bufs[] = {&bo, &ba, &bb};
+        dev->run(k, (N + 63) / 64, blob_of(sc), bufs);
+        dev->read(bo, out.data(), N * 4);
+        for (std::size_t i = 0; i < N; ++i)
+            ASSERT_EQ(out[i], a[i] + 2.5f * b[i]);
+    } // gpud Device destroyed FIRST...
+
+    // ...and the adopted device is still alive and usable after.
+    EXPECT_NE(SDL_GetGPUShaderFormats(native) & SDL_GPU_SHADERFORMAT_SPIRV,
+              0u);
+    SDL_DestroyGPUDevice(native);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+}
+
+// This backend emits SPIR-V, so an MSL-only device is refused up front.
+TEST(SdlAdopt, RefusesADeviceWithoutSpirv) {
+    SDL_InitSubSystem(SDL_INIT_VIDEO);
+    SDL_GPUDevice *msl =
+        SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, false, nullptr);
+    if (!msl)
+        GTEST_SKIP() << "no MSL-only SDL_GPU driver on this machine";
+    EXPECT_EQ(gpud::sdl::try_open_on(msl), nullptr);
+    SDL_DestroyGPUDevice(msl);
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+}
 #endif
