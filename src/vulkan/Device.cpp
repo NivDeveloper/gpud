@@ -31,7 +31,11 @@ void log(const char *msg) {
 std::string find_slangc() {
     for (const char *c :
          {"/usr/local/bin/slangc", "/opt/homebrew/bin/slangc", "slangc"}) {
+#ifdef _WIN32
+        const std::string probe = std::string(c) + " -h > NUL 2>&1";
+#else
         const std::string probe = std::string(c) + " -h > /dev/null 2>&1";
+#endif
         if (std::system(probe.c_str()) == 0) return c;
     }
     return {};

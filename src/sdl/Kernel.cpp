@@ -15,7 +15,13 @@
 #include <stdexcept>
 #include <string>
 
+#ifdef _WIN32
+#include <process.h>
+#define GPUD_GETPID _getpid
+#else
 #include <unistd.h>
+#define GPUD_GETPID getpid
+#endif
 
 namespace gpud::sdl {
 namespace {
@@ -31,7 +37,11 @@ std::string slurp(const std::filesystem::path &p) {
 std::string find_slangc() {
     for (const char *c :
          {"/usr/local/bin/slangc", "/opt/homebrew/bin/slangc", "slangc"}) {
+#ifdef _WIN32
+        const std::string probe = std::string(c) + " -h > NUL 2>&1";
+#else
         const std::string probe = std::string(c) + " -h > /dev/null 2>&1";
+#endif
         if (std::system(probe.c_str()) == 0) return c;
     }
     return {};
@@ -43,7 +53,7 @@ std::string find_slangc() {
 std::string compile_slang(const std::string &slangc, std::string_view source) {
     namespace fs = std::filesystem;
     static std::atomic<unsigned> counter{0};
-    const std::string stem = "gpud-" + std::to_string(::getpid()) + "-" +
+    const std::string stem = "gpud-" + std::to_string(GPUD_GETPID()) + "-" +
                              std::to_string(counter.fetch_add(1));
     const fs::path src = fs::temp_directory_path() / (stem + ".slang");
     const fs::path spv = fs::temp_directory_path() / (stem + ".spv");

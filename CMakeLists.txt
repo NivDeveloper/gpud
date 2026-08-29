@@ -64,7 +64,9 @@ add_library(gpud::auto_ ALIAS gpud_auto)
 target_link_libraries(gpud_auto PUBLIC gpud)
 set_target_properties(gpud_auto PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-target_compile_options(gpud_auto PRIVATE -Wall -Wextra)
+if(NOT MSVC)
+    target_compile_options(gpud_auto PRIVATE -Wall -Wextra)
+endif()
 
 # ── real backends (scaffolding: stub try_open, no SDK located/linked) ───
 # One block per backend, in auto-selection priority order. Each is a

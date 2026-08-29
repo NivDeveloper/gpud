@@ -24,8 +24,10 @@ set_target_properties(gpud_vulkan PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
 # -Wno-missing-field-initializers: `VkFoo f{VK_STRUCTURE_TYPE_...}` is
 # the standard Vulkan idiom — the omitted fields zero-initialize.
-target_compile_options(gpud_vulkan PRIVATE -Wall -Wextra
-    -Wno-missing-field-initializers)
+if(NOT MSVC)
+    target_compile_options(gpud_vulkan PRIVATE -Wall -Wextra
+        -Wno-missing-field-initializers)
+endif()
 # VMA has to agree with volk about how Vulkan is resolved, and every TU
 # including its header must see the same configuration as the one that
 # compiles it — hence on the target rather than in Vma.cpp.

@@ -9,7 +9,13 @@
 #include <memory>
 #include <string>
 
+#ifdef _WIN32
+#include <process.h>
+#define GPUD_GETPID _getpid
+#else
 #include <unistd.h>
+#define GPUD_GETPID getpid
+#endif
 
 namespace gpud::vulkan {
 namespace {
@@ -25,7 +31,7 @@ std::string slurp(const std::filesystem::path &p) {
 std::string compile_slang(const std::string &slangc, std::string_view source) {
     namespace fs = std::filesystem;
     static std::atomic<unsigned> counter{0};
-    const std::string stem = "gpud-" + std::to_string(::getpid()) + "-" +
+    const std::string stem = "gpud-" + std::to_string(GPUD_GETPID()) + "-" +
                              std::to_string(counter.fetch_add(1));
     const fs::path src = fs::temp_directory_path() / (stem + ".slang");
     const fs::path spv = fs::temp_directory_path() / (stem + ".spv");

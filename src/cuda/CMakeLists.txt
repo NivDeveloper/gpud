@@ -13,4 +13,6 @@ add_library(gpud::cuda ALIAS gpud_cuda)
 target_link_libraries(gpud_cuda PUBLIC gpud::gpud)
 set_target_properties(gpud_cuda PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-target_compile_options(gpud_cuda PRIVATE -Wall -Wextra)
+if(NOT MSVC)
+    target_compile_options(gpud_cuda PRIVATE -Wall -Wextra)
+endif()
