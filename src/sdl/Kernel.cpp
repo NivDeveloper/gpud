@@ -25,6 +25,18 @@ std::string slurp(const std::filesystem::path &p) {
     return {std::istreambuf_iterator<char>(in), {}};
 }
 
+// std::system's shell may not have /usr/local/bin or /opt/homebrew/bin
+// on PATH — probe the common install locations (vklib-proven). Called
+// lazily from do_compile so device bring-up needs no shader toolchain.
+std::string find_slangc() {
+    for (const char *c :
+         {"/usr/local/bin/slangc", "/opt/homebrew/bin/slangc", "slangc"}) {
+        const std::string probe = std::string(c) + " -h > /dev/null 2>&1";
+        if (std::system(probe.c_str()) == 0) return c;
+    }
+    return {};
+}
+
 // Slang source → SPIR-V via the slangc CLI. The slot dialect's binding
 // decorations are in the source, so the invocation is the vulkan
 // backend's, verbatim. Throws with the compiler's diagnostics.
@@ -88,6 +100,13 @@ Declared scan_declarations(std::string_view source) {
 } // namespace
 
 Kernel Device::do_compile(std::string_view source) {
+    // Resolved here, not at open: a re-probe per failed compile means
+    // a slangc installed mid-session starts working.
+    if (s_.slangc.empty()) s_.slangc = find_slangc();
+    if (s_.slangc.empty())
+        throw std::runtime_error(
+            "gpud/sdl: slangc not found (looked in /usr/local/bin, "
+            "/opt/homebrew/bin, PATH)");
     const std::string spirv = compile_slang(s_.slangc, source);
     const Declared d = scan_declarations(source);
 

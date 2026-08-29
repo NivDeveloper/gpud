@@ -16,6 +16,9 @@ namespace gpud::sdl {
 class Device final : public ::gpud::Device {
   public:
     // Everything try_open() brings up; the Device owns it from here.
+    // slangc stays empty until the first do_compile resolves it — a
+    // device without a shader compiler opens fine and fails at the
+    // operation that needs one.
     struct State {
         SDL_GPUDevice *dev = nullptr;
         std::string slangc;

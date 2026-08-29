@@ -29,27 +29,10 @@ void log(const char *msg) {
     if (on) std::fprintf(stderr, "gpud/sdl: try_open: %s\n", msg);
 }
 
-// std::system's shell may not have /usr/local/bin or /opt/homebrew/bin
-// on PATH — probe the common install locations (vklib-proven).
-std::string find_slangc() {
-    for (const char *c :
-         {"/usr/local/bin/slangc", "/opt/homebrew/bin/slangc", "slangc"}) {
-        const std::string probe = std::string(c) + " -h > /dev/null 2>&1";
-        if (std::system(probe.c_str()) == 0) return c;
-    }
-    return {};
-}
-
 } // namespace
 
 std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     Device::State s;
-
-    s.slangc = find_slangc();
-    if (s.slangc.empty())
-        return log("no slangc (looked in /usr/local/bin, /opt/homebrew/bin, "
-                    "PATH)"),
-               nullptr;
 
     // SDL has no device-selection hook on SDL_CreateGPUDevice; the
     // driver picks. -1 and 0 both mean "the obvious one".
@@ -91,11 +74,6 @@ std::unique_ptr<::gpud::Device> try_open_on(SDL_GPUDevice *dev,
     Device::State s;
     s.owned = false;
 
-    s.slangc = find_slangc();
-    if (s.slangc.empty())
-        return log("no slangc (looked in /usr/local/bin, /opt/homebrew/bin, "
-                    "PATH)"),
-               nullptr;
     if (!dev)
         return log("adopt: null device"), nullptr;
 

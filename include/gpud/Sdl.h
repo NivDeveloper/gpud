@@ -16,10 +16,12 @@ struct SDL_GPUBuffer;
 namespace gpud::sdl {
 
 // nullptr if the backend can't come up (no SDL GPU driver supporting
-// SPIR-V, no slangc). dialect() of the returned device will be
-// "slang-slot": slot-bound Slang — numbered [[vk::binding]] resources,
-// scalars in a uniform block — for consumers whose code generators
-// emit that dialect.
+// SPIR-V). slangc is resolved lazily at the first compile() and a
+// missing one fails there, never here — a consumer that only shares
+// the device needs no shader toolchain. dialect() of the returned
+// device will be "slang-slot": slot-bound Slang — numbered
+// [[vk::binding]] resources, scalars in a uniform block — for
+// consumers whose code generators emit that dialect.
 std::unique_ptr<::gpud::Device> try_open(const Options & = {});
 
 // ADOPT an externally created device (the app-owns-the-device shape: a
