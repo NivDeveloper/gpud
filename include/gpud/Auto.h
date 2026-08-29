@@ -16,13 +16,14 @@ namespace gpud {
 // Open the best available device:
 //
 //   1. If the environment variable GPUD_BACKEND is set to one of
-//      vulkan|metal|cuda|mock, open exactly that backend — nullptr if
-//      it is not compiled in or its try_open fails. No silent fallback:
-//      asking for a specific backend and getting a different one is
-//      worse than failing.
+//      vulkan|metal|cuda|sdl|mock, open exactly that backend — nullptr
+//      if it is not compiled in or its try_open fails. No silent
+//      fallback: asking for a specific backend and getting a different
+//      one is worse than failing.
 //   2. Otherwise walk the compiled-in backends native-first — CUDA,
-//      then Metal, then Vulkan — returning the first whose try_open
-//      succeeds. (mock is env-opt-in only; it never wins auto-selection.)
+//      then Metal, then Vulkan, then SDL — returning the first whose
+//      try_open succeeds. (mock is env-opt-in only; it never wins
+//      auto-selection.)
 //   3. Otherwise nullptr.
 std::unique_ptr<Device> open_default();
 
