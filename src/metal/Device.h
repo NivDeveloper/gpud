@@ -38,9 +38,9 @@ class Device final : public ::gpud::Device {
     void read(const Buffer &src, void *dst, std::size_t bytes) override;
 
     // Device.cpp (→ Device.mm)
-    void run(const Kernel &kernel, std::size_t groups,
-             std::span<const std::byte> scalars,
-             std::span<Buffer *const> buffers) override;
+    Ticket run(const Kernel &kernel, std::size_t groups,
+               std::span<const std::byte> scalars,
+               std::span<Buffer *const> buffers) override;
 
   protected:
     // Kernel.cpp (→ Kernel.mm)

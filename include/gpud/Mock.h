@@ -78,16 +78,16 @@ class Device final : public ::gpud::Device {
         log.reads.push_back({b.id, bytes});
     }
 
-    void run(const Kernel &kernel, std::size_t groups,
-             std::span<const std::byte> scalars,
-             std::span<Buffer *const> buffers) override {
+    Ticket run(const Kernel &kernel, std::size_t groups,
+               std::span<const std::byte> scalars,
+               std::span<Buffer *const> buffers) override {
         Run r;
         r.kernel = id(kernel);
         r.groups = groups;
         r.scalars.assign(scalars.begin(), scalars.end());
         for (Buffer *b : buffers) r.buffers.push_back(id(*b));
         log.runs.push_back(std::move(r));
-        ticket_.fetch_add(1, std::memory_order_release);
+        return {ticket_.fetch_add(1, std::memory_order_release) + 1};
     }
 
     // The timeline, mock-style: run() ticks the counter and the work is
@@ -96,13 +96,13 @@ class Device final : public ::gpud::Device {
     // ticket bookkeeping against this without a GPU. Atomic because the
     // contract makes these three callable from another thread while one
     // is inside a Device call — the mock owes that like any backend.
-    std::uint64_t submitted() const override {
-        return ticket_.load(std::memory_order_acquire);
+    Ticket submitted() const override {
+        return {ticket_.load(std::memory_order_acquire)};
     }
-    std::uint64_t completed() const override {
-        return ticket_.load(std::memory_order_acquire);
+    Ticket completed() const override {
+        return {ticket_.load(std::memory_order_acquire)};
     }
-    void wait(std::uint64_t ticket) override {
+    void wait(Ticket ticket) override {
         // Debug-only, and compiled out of the default Release build:
         // tests must not depend on it firing.
         assert(ticket <= submitted() && "waiting on an unissued ticket");

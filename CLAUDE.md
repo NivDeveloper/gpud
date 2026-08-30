@@ -35,7 +35,9 @@ cuda/metal remain scaffolding stubs (try_open returns nullptr).
   first — read() *and* write(). Backends may batch and sync only where
   the host observes.
 - **Device timeline.** submitted()/completed()/wait() expose one
-  monotonic ticket per run(), plus non-virtual flush(). Virtual with
+  monotonic Ticket per run(), plus non-virtual flush(); run() returns
+  the Ticket it occupies. Ticket is a one-field VALUE type (compare,
+  never reuse) — not a handle, nothing to release. Virtual with
   defaults meaning "nothing is outstanding", which is accurate for a
   blocking backend — do not make them pure. The rejected shapes stay
   rejected: no Signal/Fence objects, no wait/signal lists on run().

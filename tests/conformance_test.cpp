@@ -19,6 +19,14 @@
 
 #include <gtest/gtest.h>
 
+#include <ostream>
+
+namespace gpud {
+inline void PrintTo(const Ticket &t, std::ostream *os) {
+    *os << "Ticket{" << t.value << "}";
+}
+} // namespace gpud
+
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -212,8 +220,8 @@ TEST_P(Conformance, TimelineNeverRunsAheadAndSettlesAtFlush) {
     SaxpyScalars sc{1.0f, N};
     gpud::Buffer *buffers[] = {&bo, &ba, &bb};
 
-    const std::uint64_t before = dev.submitted();
-    std::uint64_t seen_submitted = before, seen_completed = dev.completed();
+    const gpud::Ticket before = dev.submitted();
+    gpud::Ticket seen_submitted = before, seen_completed = dev.completed();
     for (int i = 0; i < 3; ++i) {
         dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
         EXPECT_GE(dev.submitted(), seen_submitted) << "submitted() went back";
@@ -222,12 +230,12 @@ TEST_P(Conformance, TimelineNeverRunsAheadAndSettlesAtFlush) {
         seen_submitted = dev.submitted();
         seen_completed = dev.completed();
     }
-    const std::uint64_t after = dev.submitted();
+    const gpud::Ticket after = dev.submitted();
 
     // One ticket per run() — but only for a backend that issues tickets
     // at all; the base-class defaults leave this at zero and stay
     // conformant.
-    if (after != before) EXPECT_EQ(after, before + 3);
+    if (after != before) EXPECT_EQ(after.value, before.value + 3);
 
     dev.flush();
     EXPECT_EQ(dev.completed(), dev.submitted());
@@ -235,7 +243,7 @@ TEST_P(Conformance, TimelineNeverRunsAheadAndSettlesAtFlush) {
 
     // Waiting past the last ticket issued is a caller error that must
     // return rather than block on a value nothing will ever signal.
-    dev.wait(after + 1000);
+    dev.wait(gpud::Ticket{after.value + 1000});
 }
 
 // The contract's one thread-safety carve-out: submitted(), completed()
@@ -257,12 +265,12 @@ TEST_P(Conformance, TimelineIsSafeToPollFromAnotherThread) {
     std::atomic<bool> stop{false};
     std::atomic<int> samples{0};
     std::thread poller([&] {
-        std::uint64_t last_completed = 0, last_submitted = 0;
+        gpud::Ticket last_completed, last_submitted;
         while (!stop.load(std::memory_order_relaxed)) {
             // completed() first: a submitted() sampled after it can only
             // have grown, so completed <= submitted must hold.
-            const std::uint64_t c = dev.completed();
-            const std::uint64_t s = dev.submitted();
+            const gpud::Ticket c = dev.completed();
+            const gpud::Ticket s = dev.submitted();
             EXPECT_GE(c, last_completed) << "completed() went backwards";
             EXPECT_GE(s, last_submitted) << "submitted() went backwards";
             EXPECT_LE(c, s) << "completed() ran ahead of submitted()";
@@ -278,6 +286,27 @@ TEST_P(Conformance, TimelineIsSafeToPollFromAnotherThread) {
     stop.store(true, std::memory_order_relaxed);
     poller.join();
     EXPECT_GT(samples.load(), 0) << "poller never ran";
+}
+
+// run() names the tick it occupies: equal to submitted() right after,
+// strictly increasing, and completed() reaches it once waited.
+TEST_P(Conformance, RunReturnsItsTicket) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    gpud::Device &dev = *dev_;
+
+    constexpr std::uint32_t N = 256;
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    const SaxpyScalars sc{1.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &a};
+
+    const gpud::Ticket t1 = dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    EXPECT_EQ(t1, dev.submitted());
+    const gpud::Ticket t2 = dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    EXPECT_LT(t1, t2);
+    dev.wait(t2);
+    EXPECT_GE(dev.completed(), t2);
 }
 
 // Requirement: a Buffer whose handle dies must not take its memory with

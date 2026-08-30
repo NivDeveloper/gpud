@@ -256,19 +256,19 @@ Device::~Device() {
     vkDestroyInstance(s.instance, nullptr);
 }
 
-std::uint64_t Device::completed() const {
+Ticket Device::completed() const {
     // Lock-free by design: vkGetSemaphoreCounterValue has no externally
     // synchronized parameter, so polling while another thread submits is
     // allowed.
     std::uint64_t value = 0;
     check(vkGetSemaphoreCounterValue(s.device, s.timeline, &value),
           "vkGetSemaphoreCounterValue");
-    return value;
+    return {value};
 }
 
-void Device::wait(std::uint64_t ticket) {
+void Device::wait(Ticket ticket) {
     std::unique_lock lock(m_);
-    wait_locked(lock, ticket);
+    wait_locked(lock, ticket.value);
 }
 
 void Device::wait_locked(std::unique_lock<std::mutex> &lock,
@@ -300,7 +300,7 @@ void Device::wait_locked(std::unique_lock<std::mutex> &lock,
 
 void Device::defer_release(std::uint64_t ticket, std::function<void()> release) {
     std::lock_guard lock(m_);
-    if (ticket <= completed_cache_ || ticket <= completed()) {
+    if (ticket <= completed_cache_ || ticket <= completed().value) {
         release();
         return;
     }
@@ -313,7 +313,7 @@ void Device::reclaim() {
 }
 
 void Device::reclaim_locked(bool force) {
-    if (!force) completed_cache_ = completed();
+    if (!force) completed_cache_ = completed().value;
     const std::uint64_t done = completed_cache_;
 
     // Tickets only increase, so both queues are ordered: the first entry
@@ -421,9 +421,9 @@ void Device::throttle_locked(std::unique_lock<std::mutex> &lock) {
     wait_locked(lock, issued - s.max_queued + 1);
 }
 
-void Device::run(const Kernel &kernel, std::size_t groups,
-                 std::span<const std::byte> scalars,
-                 std::span<Buffer *const> buffers) {
+Ticket Device::run(const Kernel &kernel, std::size_t groups,
+                   std::span<const std::byte> scalars,
+                   std::span<Buffer *const> buffers) {
     const auto *k = static_cast<const KernelImpl *>(kernel.impl());
 
     // Push data = the scalar blob, then each buffer's device address at
@@ -475,6 +475,7 @@ void Device::run(const Kernel &kernel, std::size_t groups,
     const std::uint64_t ticket = submitted_.load(std::memory_order_relaxed) + 1;
     submitted_.store(ticket, std::memory_order_release);
     for (Buffer *b : buffers) impl_of(*b).last_use = ticket;
+    return {ticket};
 }
 
 } // namespace gpud::vulkan

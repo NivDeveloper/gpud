@@ -16,8 +16,8 @@ std::unique_ptr<::gpud::Device> try_open(const Options &) {
     return nullptr;
 }
 
-void Device::run(const Kernel &, std::size_t, std::span<const std::byte>,
-                 std::span<Buffer *const>) {
+Ticket Device::run(const Kernel &, std::size_t, std::span<const std::byte>,
+                   std::span<Buffer *const>) {
     // TODO(impl): cuLaunchKernel with `groups` blocks; kernel
     // parameters are the scalars (laid out as the dialect declared)
     // followed by each buffer's device pointer, positional. Launches

@@ -79,7 +79,7 @@ void Device::write(Buffer &dst, const void *src, std::size_t bytes) {
     // synchronizes first (contract note 1).
     assert(bytes <= dst.bytes());
     BufferImpl &b = impl_of(dst);
-    wait(b.last_use);
+    wait(Ticket{b.last_use});
     std::memcpy(b.mapped, src, bytes);
 }
 
@@ -89,7 +89,7 @@ void Device::read(const Buffer &src, void *dst, std::size_t bytes) {
     // work is done a plain memcpy is complete and correct.
     assert(bytes <= src.bytes());
     BufferImpl &b = impl_of(src);
-    wait(b.last_use);
+    wait(Ticket{b.last_use});
     std::memcpy(dst, b.mapped, bytes);
 }
 

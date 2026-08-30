@@ -8,6 +8,14 @@
 
 #include <gtest/gtest.h>
 
+#include <ostream>
+
+namespace gpud {
+inline void PrintTo(const Ticket &t, std::ostream *os) {
+    *os << "Ticket{" << t.value << "}";
+}
+} // namespace gpud
+
 static_assert(GPUD_VERSION_MAJOR >= 0 && sizeof(gpud::version) > 1,
               "generated Version.h is coherent");
 
@@ -20,6 +28,17 @@ static_assert(GPUD_VERSION_MAJOR >= 0 && sizeof(gpud::version) > 1,
 #include <vector>
 
 namespace {
+
+// A Ticket is a value, not a handle: aggregate, trivially copyable,
+// ordered by its one field.
+static_assert(std::is_aggregate_v<gpud::Ticket>);
+static_assert(std::is_trivially_copyable_v<gpud::Ticket>);
+
+TEST(Ticket, OrdersByValue) {
+    EXPECT_LT(gpud::Ticket{}, gpud::Ticket{1});
+    EXPECT_EQ(gpud::Ticket{2}, gpud::Ticket{2});
+    EXPECT_GE(gpud::Ticket{3}, gpud::Ticket{2});
+}
 
 // Handles are move-only RAII.
 static_assert(std::is_move_constructible_v<gpud::Buffer>);
@@ -127,8 +146,8 @@ TEST(MockDevice, TimelineTicksOncePerRun) {
     gpud::mock::Device mock;
     gpud::Device &dev = mock;
 
-    EXPECT_EQ(dev.submitted(), 0u);
-    EXPECT_EQ(dev.completed(), 0u);
+    EXPECT_EQ(dev.submitted().value, 0u);
+    EXPECT_EQ(dev.completed().value, 0u);
 
     gpud::Buffer out = dev.alloc(16);
     static constexpr char source[] = "__kernel__ noop(out)";
@@ -136,21 +155,22 @@ TEST(MockDevice, TimelineTicksOncePerRun) {
     gpud::Buffer *buffers[] = {&out};
 
     for (std::uint64_t i = 1; i <= 3; ++i) {
-        dev.run(kernel, 1, {}, buffers);
-        EXPECT_EQ(dev.submitted(), i);
-        EXPECT_EQ(dev.completed(), i);   // the mock finishes inline
+        const gpud::Ticket t = dev.run(kernel, 1, {}, buffers);
+        EXPECT_EQ(t.value, i);              // run() names its own tick
+        EXPECT_EQ(t, dev.submitted());
+        EXPECT_EQ(dev.completed(), t);   // the mock finishes inline
     }
 
     dev.flush();   // nothing to wait for, and it enqueues nothing
     EXPECT_EQ(dev.completed(), dev.submitted());
-    EXPECT_EQ(dev.submitted(), 3u);
+    EXPECT_EQ(dev.submitted().value, 3u);
 
     // Storage operations do not occupy a tick — only run() does.
     const std::array<std::byte, 16> src{};
     dev.write(out, src.data(), src.size());
     std::array<std::byte, 16> dst{};
     dev.read(out, dst.data(), dst.size());
-    EXPECT_EQ(dev.submitted(), 3u);
+    EXPECT_EQ(dev.submitted().value, 3u);
 }
 
 // The pull-model carrier: empty is false and must not be asked; a

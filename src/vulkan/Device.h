@@ -63,19 +63,19 @@ class Device final : public ::gpud::Device {
     void read(const Buffer &src, void *dst, std::size_t bytes) override;
 
     // Device.cpp
-    void run(const Kernel &kernel, std::size_t groups,
-             std::span<const std::byte> scalars,
-             std::span<Buffer *const> buffers) override;
+    Ticket run(const Kernel &kernel, std::size_t groups,
+               std::span<const std::byte> scalars,
+               std::span<Buffer *const> buffers) override;
 
     // The device timeline, backed by a timeline VkSemaphore (core 1.2).
     // These three are the thread-safe corner of the interface: they may
     // be called while another thread is inside run()/read()/write().
     // Everything else stays externally synchronized.
-    std::uint64_t submitted() const override {
-        return submitted_.load(std::memory_order_acquire);
+    Ticket submitted() const override {
+        return {submitted_.load(std::memory_order_acquire)};
     }
-    std::uint64_t completed() const override;
-    void wait(std::uint64_t ticket) override;
+    Ticket completed() const override;
+    void wait(Ticket ticket) override;
 
     // Deferred release. A Buffer handle may die while queued work still
     // reads its memory, so BufferImpl hands its teardown here instead of

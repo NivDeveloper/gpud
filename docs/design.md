@@ -346,23 +346,25 @@ in-order execution context (one queue/stream), so ordering within a
 device is already total — GPU→GPU semaphores between its own commands
 add nothing. The only thing fine-grained sync buys here is letting the
 host observe and wait on *positions in that order* without the big
-hammer of `read()`. That needs no new handle type:
+hammer of `read()`. That needs no handle — one comparable value type:
 
 ```cpp
+struct Ticket { std::uint64_t value; };   // one tick; compare to order
+
 class Device {
-    // ... the five ops, unchanged ...
+    // ... the five ops; run() returns the Ticket it occupies ...
 
     // The device timeline: every run() (and, with batching, every
     // enqueued write/read) occupies one tick, in call order.
-    virtual std::uint64_t submitted() const;   // ticket of last enqueued work
-    virtual std::uint64_t completed() const;   // highest finished ticket (poll)
-    virtual void wait(std::uint64_t ticket);   // block host until ticket done
+    virtual Ticket submitted() const;   // ticket of last enqueued work
+    virtual Ticket completed() const;   // highest finished ticket (poll)
+    virtual void wait(Ticket);          // block host until ticket done
 };
 ```
 
 Tickets *refine* the ordering contract rather than replacing it:
 `read()` keeps its exact meaning and becomes, internally, "wait(last
-ticket touching this buffer) + copy". No new move-only handle with
+ticket touching this buffer) + copy". No move-only handle with
 lifetime rules, no wait/signal lists on run(), and values are never
 reused, so the scheme is race-free by construction (the same property
 that makes timelines strictly better than binary semaphores).

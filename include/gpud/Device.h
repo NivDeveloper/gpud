@@ -53,6 +53,7 @@
 //     open, failed operations throw std::runtime_error — kernel compile
 //     errors carry the compiler diagnostics verbatim.
 
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -137,6 +138,16 @@ struct BufferSource {
     Buffer *current() const { return fn(user); }
 };
 
+// One tick of the device timeline. Every run() occupies the next tick,
+// in call order, and returns it; completed() >= t means tick t's
+// dispatch has finished on the device. Value 0 is "before any work".
+// A value, not a handle: nothing to release, never reused; compare
+// tickets to order work.
+struct Ticket {
+    std::uint64_t value = 0;
+    friend auto operator<=>(const Ticket &, const Ticket &) = default;
+};
+
 // Move-only RAII handle to a compiled kernel. Same rules as Buffer.
 class Kernel {
   public:
@@ -190,31 +201,30 @@ class Device {
     // ── run ──────────────────────────────────────────────────────────
     // Launch `groups` workgroups. `scalars` is the scalar section of the
     // kernel's parameter data, laid out exactly as the dialect declared
-    // it. `buffers` is positional — see contract note 2 above.
-    virtual void run(const Kernel &kernel, std::size_t groups,
-                     std::span<const std::byte> scalars,
-                     std::span<Buffer *const> buffers) = 0;
+    // it. `buffers` is positional — see contract note 2 above. Returns
+    // the Ticket this dispatch occupies on the device timeline.
+    virtual Ticket run(const Kernel &kernel, std::size_t groups,
+                       std::span<const std::byte> scalars,
+                       std::span<Buffer *const> buffers) = 0;
 
     // ── the device timeline ──────────────────────────────────────────
-    // Every run() occupies one tick of a monotonically increasing 64-bit
-    // counter, in call order. Tickets refine the ordering contract
-    // rather than replacing it: read() still means what it always did,
-    // and is internally "wait(last ticket touching this buffer) + copy".
-    // Values are never reused, so the scheme is race-free by
-    // construction.
+    // Every run() occupies one Ticket, in call order, and hands it
+    // back. Tickets refine the ordering contract rather than replacing
+    // it: read() still means what it always did, and is internally
+    // "wait(last ticket touching this buffer) + copy".
     //
     // The defaults below describe a backend that completes every call
-    // before returning (mock's storage half, the stub backends): such a
-    // device never has outstanding work, so a timeline pinned at zero is
-    // accurate. Backends that queue work override all three.
+    // before returning (the stub backends): such a device never has
+    // outstanding work, so a timeline pinned at zero is accurate.
+    // Backends that queue work override all three.
     //
     // submitted()/completed() poll and never block; wait() blocks until
     // the ticket has completed. Waiting on a ticket beyond submitted()
     // is a caller error and returns immediately rather than hanging.
 
-    virtual std::uint64_t submitted() const { return 0; }   // last enqueued
-    virtual std::uint64_t completed() const { return 0; }   // highest done
-    virtual void wait(std::uint64_t /*ticket*/) {}
+    virtual Ticket submitted() const { return {}; }   // last enqueued
+    virtual Ticket completed() const { return {}; }   // highest done
+    virtual void wait(Ticket /*ticket*/) {}
 
     // Block until everything enqueued so far has completed. Non-virtual:
     // it is exactly wait(submitted()), and a backend that got those two

@@ -79,9 +79,9 @@ Device::~Device() {
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
 }
 
-void Device::run(const Kernel &kernel, std::size_t groups,
-                 std::span<const std::byte> scalars,
-                 std::span<Buffer *const> buffers) {
+Ticket Device::run(const Kernel &kernel, std::size_t groups,
+                   std::span<const std::byte> scalars,
+                   std::span<Buffer *const> buffers) {
     const KernelImpl &k = impl_of(kernel);
     if (buffers.empty() || buffers.size() != 1 + k.n_readonly)
         throw std::runtime_error(
@@ -117,6 +117,7 @@ void Device::run(const Kernel &kernel, std::size_t groups,
                                  SDL_GetError());
     SDL_WaitForGPUFences(s_.dev, true, &fence, 1);
     SDL_ReleaseGPUFence(s_.dev, fence);
+    return {ticket_.fetch_add(1, std::memory_order_release) + 1};
 }
 
 SDL_GPUDevice *native_device(::gpud::Device &dev) {

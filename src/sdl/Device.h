@@ -9,6 +9,8 @@
 
 #include <SDL3/SDL.h>
 
+#include <atomic>
+#include <cstdint>
 #include <string>
 
 namespace gpud::sdl {
@@ -34,9 +36,18 @@ class Device final : public ::gpud::Device {
     void read(const Buffer &src, void *dst, std::size_t bytes) override;
 
     // Device.cpp
-    void run(const Kernel &kernel, std::size_t groups,
-             std::span<const std::byte> scalars,
-             std::span<Buffer *const> buffers) override;
+    Ticket run(const Kernel &kernel, std::size_t groups,
+               std::span<const std::byte> scalars,
+               std::span<Buffer *const> buffers) override;
+
+    // Blocking backend: work completes inside run(), so one counter is
+    // the whole timeline and completed() == submitted() always.
+    Ticket submitted() const override {
+        return {ticket_.load(std::memory_order_acquire)};
+    }
+    Ticket completed() const override {
+        return {ticket_.load(std::memory_order_acquire)};
+    }
 
     // The visualizer seam behind gpud::sdl::native_device().
     SDL_GPUDevice *native() const { return s_.dev; }
@@ -47,6 +58,7 @@ class Device final : public ::gpud::Device {
 
   private:
     State s_;
+    std::atomic<std::uint64_t> ticket_{0};
 };
 
 } // namespace gpud::sdl

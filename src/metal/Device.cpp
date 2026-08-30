@@ -17,8 +17,8 @@ std::unique_ptr<::gpud::Device> try_open(const Options &) {
     return nullptr;
 }
 
-void Device::run(const Kernel &, std::size_t, std::span<const std::byte>,
-                 std::span<Buffer *const>) {
+Ticket Device::run(const Kernel &, std::size_t, std::span<const std::byte>,
+                   std::span<Buffer *const>) {
     // TODO(impl): compute command encoder; pass `scalars` via
     // setBytes, bind buffers positionally via setBuffer(…, k);
     // dispatch `groups` threadgroups. Free to batch command buffers —
