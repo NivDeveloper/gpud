@@ -466,6 +466,8 @@ TEST(SdlInterop, NativeHandlesAreLive) {
 
     gpud::Buffer buf = dev->alloc(64);
     EXPECT_NE(gpud::sdl::native_buffer(buf), nullptr);
+    gpud::Buffer empty;
+    EXPECT_EQ(gpud::sdl::native_buffer(empty), nullptr);   // not a null deref
 
     auto foreign = gpud::mock::try_open();
     EXPECT_EQ(gpud::sdl::native_device(*foreign), nullptr);

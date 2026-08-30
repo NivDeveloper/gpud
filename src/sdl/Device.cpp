@@ -124,6 +124,8 @@ SDL_GPUDevice *native_device(::gpud::Device &dev) {
     return d ? d->native() : nullptr;
 }
 
-SDL_GPUBuffer *native_buffer(::gpud::Buffer &buf) { return impl_of(buf).buf; }
+SDL_GPUBuffer *native_buffer(::gpud::Buffer &buf) {
+    return buf ? impl_of(buf).buf : nullptr;
+}
 
 } // namespace gpud::sdl

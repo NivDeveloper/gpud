@@ -15,7 +15,9 @@ auto-selection work.
    `alloc`/`write`/`read` (storage), `compile` (build), `run` (launch) —
    plus a single introspection member, `dialect()`, and (since 0.2) the
    device timeline `submitted`/`completed`/`wait` for observing queued
-   work without forcing it.
+   work without forcing it. Since 0.5, `BufferSource` — the pull-model
+   carrier producers and consumers exchange, and the ONE piece of gpud
+   whose reason to exist is another library.
 2. **Backends are separately compiled static libraries** — one per
    backend, each linking its SDK privately. The interface header stays
    dependency-free (std only).
@@ -67,6 +69,10 @@ struct Options { int device_index = -1; };
 // A handle must not outlive its Device. Buffer carries its byte size.
 class Buffer { /* unique_ptr<Impl>, size_t bytes */ };
 class Kernel { /* unique_ptr<Impl> */ };
+
+// The pull-model carrier (0.5): a producer's ADL source_of(const P &)
+// returns one; a consumer asks current() at the moment of use.
+struct BufferSource { Buffer *(*fn)(void *); void *user; Buffer *current() const; };
 
 class Device {
   public:
@@ -132,7 +138,16 @@ zero-hash caching for free.
 carve-out: `submitted`/`completed`/`wait` may be called from another
 thread while one is inside a Device call, since observing the timeline
 from elsewhere is the only reason to expose it. Distinct Devices are
-independent.
+independent. `BufferSource::current()` runs on the CONSUMER's thread
+and holds nothing: the producer must not replace or destroy the
+returned Buffer until the consumer's last use of it, which for a
+renderer is the submit. A producer on the consumer's thread has that
+by program order; one on its own thread publishes through a
+role-swapping type on the consumer's side, which hands `current()` a
+slot the producer is not writing. The native seam (`Sdl.h`) adds a
+second, separate rule: what it hands out are SDL objects under SDL's
+own threading rules, which is why a renderer records on one thread
+while `run()` blocks on another.
 
 **Why these five and not more**: `alloc`/`write`/`read` is the minimum
 to get data there and back; `compile`/`run` is literally "build and run
@@ -144,6 +159,8 @@ kernels". Deliberately excluded:
 - async handles/streams — covered by the ordering contract until
   profiling says otherwise
 - shader-reflection/metadata queries — the ABI is positional
+- a producer/consumer sync type — the consumer's: it knows the frame,
+  gpud does not, and `BufferSource` is deliberately only the carrier
 
 **Portability check** — how each target maps:
 
@@ -377,7 +394,12 @@ Sequencing and contract notes, borne out in the build:
 - **Interop-grade sync** (handing a semaphore to a renderer — external
   semaphore handles, `MTLSharedEvent` export, `cuImportExternalSemaphore`)
   is the one case that would need an exported opaque handle. Separate,
-  later decision; nothing in the ticket model forecloses it.
+  later decision; nothing in the ticket model forecloses it. The
+  HOST-side half of that question — a producer on one thread, a
+  renderer on another, sharing a buffer — is answered without it: a
+  role-swapping type on the consumer's side (the Threading paragraph
+  above), which needs no GPU sync at all for a producer that parks a
+  fresh buffer per step.
 
 ### What the build added to the note
 

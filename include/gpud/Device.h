@@ -121,9 +121,19 @@ class Buffer {
 // resident right now — consumers skip, they do not fail. The source is
 // valid while the producer object lives at its address; the returned
 // Buffer obeys the normal handle rules (same Device, do not outlive it).
+//
+// Threads. current() runs on the CONSUMER's thread and hands back a
+// borrowed pointer with no hold on it: the producer must not replace
+// or destroy that Buffer while a consumer holds the pointer — from
+// the call to the last use, which for a renderer is the submit. A
+// producer driven on the consumer's thread satisfies that by program
+// order. A producer on another thread publishes through a role-
+// swapping type on the consumer's side, one that hands current() a
+// slot the producer is not writing; gpud carries only the carrier.
 struct BufferSource {
     Buffer *(*fn)(void *) = nullptr;
     void *user = nullptr;
+    explicit operator bool() const { return fn != nullptr; }
     Buffer *current() const { return fn(user); }
 };
 

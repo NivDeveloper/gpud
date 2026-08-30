@@ -153,6 +153,30 @@ TEST(MockDevice, TimelineTicksOncePerRun) {
     EXPECT_EQ(dev.submitted(), 3u);
 }
 
+// The pull-model carrier: empty is false and must not be asked; a
+// source over a buffer answers with that buffer, re-asked each time,
+// and answers nullptr — skip, not fail — once the producer has nothing.
+TEST(BufferSource, AnswersWhatTheProducerHoldsNow) {
+    gpud::mock::Device mock;
+    gpud::Device &dev = mock;
+    EXPECT_FALSE(gpud::BufferSource{});
+
+    gpud::Buffer held = dev.alloc(16);
+    gpud::Buffer *slot = &held;
+    const gpud::BufferSource src{
+        +[](void *u) { return *static_cast<gpud::Buffer **>(u); }, &slot};
+    EXPECT_TRUE(src);
+    EXPECT_EQ(src.current(), &held);
+
+    gpud::Buffer other = dev.alloc(32);
+    slot = &other;   // the producer moved: the same source, re-asked
+    EXPECT_EQ(src.current(), &other);
+    EXPECT_EQ(src.current()->bytes(), 32u);
+
+    slot = nullptr;   // nothing resident: consumers skip
+    EXPECT_EQ(src.current(), nullptr);
+}
+
 TEST(OpenDefault, HonorsGpudBackendMock) {
     ::setenv("GPUD_BACKEND", "mock", /*overwrite=*/1);
     auto dev = gpud::open_default();

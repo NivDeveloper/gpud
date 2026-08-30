@@ -267,7 +267,11 @@ in auto-selection — native backends first.
   dialect pact.
 - v1 execution is FULLY BLOCKING (submit + fence wait in run, write
   and read), so the base timeline defaults stand and buffer teardown
-  releases immediately. Batching = fences ring + tickets, the vulkan
+  releases immediately — for gpud's own work. A renderer's command
+  buffer on the shared device is outside that sentence: SDL defers
+  the free past SUBMITTED work, and a handle bound but not yet
+  submitted is the consumer's to keep alive (BufferSource's thread
+  rule in Device.h). Batching = fences ring + tickets, the vulkan
   shape, when a consumer's frame loop needs it.
 - try_open probes: SDL_InitSubSystem (ref-counted, paired in
   ~Device), the SDL_VULKAN_LIBRARY hint filled from

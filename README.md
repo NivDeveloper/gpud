@@ -12,7 +12,9 @@ stubs. The SDL backend consumes slot-bound Slang ("slang-slot") and
 exports its native SDL_GPUDevice/SDL_GPUBuffer handles, so a renderer
 can share the device and read compute buffers zero-copy;
 `BufferSource` + the `source_of` protocol are the pull-model
-vocabulary producers and consumers exchange.
+vocabulary producers and consumers exchange — `current()` runs on the
+consumer's thread and holds nothing, so an off-thread producer
+publishes through a role-swapping type on the consumer's side.
 
 ## Build
 
@@ -45,7 +47,7 @@ points SDL at a /usr/local or /opt/homebrew loader when the
 include(FetchContent)
 FetchContent_Declare(gpud
   GIT_REPOSITORY https://github.com/NivDeveloper/gpud
-  GIT_TAG v0.5.0)   # ← pin a release; bump this line to update
+  GIT_TAG v0.5.1)   # ← pin a release; bump this line to update
 FetchContent_MakeAvailable(gpud)
 
 target_link_libraries(app PRIVATE gpud::auto_)   # underscore: `auto` is a keyword

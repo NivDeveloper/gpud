@@ -1,6 +1,7 @@
 // BufferImpl plus alloc/write/read — the simplest correct strategy:
 // one transfer buffer per call, fence-waited, released. Pooling is a
-// later optimization; blocking run() means no last_use bookkeeping.
+// later optimization; blocking run() means no last_use bookkeeping
+// for gpud's own work (a renderer's is its own, see Buffer.h).
 
 #include "Buffer.h"
 

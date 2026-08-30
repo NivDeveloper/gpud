@@ -30,7 +30,16 @@ std::unique_ptr<::gpud::Device> try_open(const Options & = {});
 // carry that usage). Non-owning; valid only while the Device / Buffer
 // lives; the arguments must have come from THIS backend — a foreign
 // Device yields nullptr, a foreign Buffer is undefined like any
-// cross-device handle misuse.
+// cross-device handle misuse. An EMPTY Buffer yields nullptr.
+//
+// Threads: two rules, not one. The Device's own calls are externally
+// synchronized among THEMSELVES (Device.h). What this seam hands out
+// are SDL objects, and SDL_GPU's own rules govern them — command
+// buffers are per-thread, acquire/submit/create/release are
+// thread-safe — which is why a renderer may record on one thread
+// while run() blocks on another. What no rule orders is a buffer
+// re-parked by a producer while a renderer still holds its native
+// handle; see BufferSource.
 SDL_GPUDevice *native_device(::gpud::Device &);
 SDL_GPUBuffer *native_buffer(::gpud::Buffer &);
 

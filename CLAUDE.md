@@ -13,7 +13,9 @@ slangc → SPIR-V resolved lazily at first compile (bring-up needs no
 toolchain), fully blocking v1 (base timeline defaults), native
 SDL_GPUDevice/SDL_GPUBuffer handle export for renderer sharing;
 BufferSource + the source_of ADL protocol (Device.h) are the
-pull-model interchange vocabulary.
+pull-model interchange vocabulary; current() runs on the consumer's
+thread and holds nothing, so a producer on another thread publishes
+through a role-swapping type on the consumer's side.
 cuda/metal remain scaffolding stubs (try_open returns nullptr).
 
 ## Invariants (do not break)
@@ -45,6 +47,12 @@ cuda/metal remain scaffolding stubs (try_open returns nullptr).
 - **External synchronization, with one carve-out.** Calls on one Device
   are externally synchronized, except submitted()/completed()/wait(),
   which are callable from any thread. Distinct Devices are independent.
+- **BufferSource holds nothing.** current() is the consumer's call, on
+  the consumer's thread, and the pointer it returns is borrowed until
+  the consumer's last use of it. A producer must not replace or destroy
+  that Buffer meanwhile; a producer on another thread publishes through
+  a role-swapping type on the consumer's side. gpud carries the carrier
+  and states the rule — it does not carry the sync type.
 - **Positional buffer ABI.** buffers[0] = output, buffers[1+k] = input
   leaf k. No reflection/metadata queries; caller and kernel-source
   generator agree on the order. How a buffer reaches the kernel (BDA
@@ -116,7 +124,8 @@ carries no reflection, so do_compile SCANS THE SOURCE for its
 declarations — legitimate only because the dialect is self-describing,
 and part of the dialect pact; v1 is fully blocking (submit + fence
 wait per run/write/read; the base timeline defaults are then correct —
-do not override them until batching lands); try_open points
+do not override them until batching lands — and "releases immediately"
+covers gpud's own work, not a renderer's command buffer); try_open points
 SDL_VULKAN_LIBRARY at a /usr/local or /opt/homebrew loader when unset
 (SDL dlopens by bare name and misses /usr/local/lib; a user's env
 wins); SDL_InitSubSystem/SDL_QuitSubSystem are ref-counted and paired
