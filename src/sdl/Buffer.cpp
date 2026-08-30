@@ -66,6 +66,18 @@ Buffer Device::alloc(std::size_t bytes) {
 void Device::write(Buffer &dst, const void *src, std::size_t bytes) {
     assert(bytes <= dst.bytes());
     if (bytes == 0) return;
+
+    // Overwriting storage a queued dispatch still touches is the one
+    // hazard SDL names outright ("you must take care not to overwrite
+    // a section of data that has been referenced in a command"), and
+    // cycling is no answer: it would rotate the internal resource out
+    // from under native_buffer() handles. Drain the outstanding
+    // dispatches, then upload as before — coarser than a per-buffer
+    // ticket, and write() is a setup path, not a hot one.
+    {
+        std::unique_lock lock(m_);
+        wait_locked(lock, submitted_.load(std::memory_order_relaxed));
+    }
     SDL_GPUTransferBuffer *tb =
         make_transfer(s_.dev, SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD, bytes);
     void *map = SDL_MapGPUTransferBuffer(s_.dev, tb, false);

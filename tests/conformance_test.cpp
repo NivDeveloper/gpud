@@ -46,6 +46,7 @@ namespace {
 struct Backend {
     const char *name;
     std::unique_ptr<gpud::Device> (*open)();
+    std::unique_ptr<gpud::Device> (*open_with)(const gpud::Options &);
     // Kernel source in the backend's dialect computing
     //   out[i] = in0[i] + s * in1[i]   for i < n
     // with scalars {float s; uint32 n} and 64-wide workgroups.
@@ -105,12 +106,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
 #endif
 
 const Backend kBackends[] = {
-    {"mock", [] { return gpud::mock::try_open(); }, nullptr},
+    {"mock", [] { return gpud::mock::try_open(); },
+     [](const gpud::Options &o) { return gpud::mock::try_open(o); }, nullptr},
 #ifdef GPUD_HAS_VULKAN
-    {"vulkan", [] { return gpud::vulkan::try_open(); }, vulkan_saxpy},
+    {"vulkan", [] { return gpud::vulkan::try_open(); },
+     [](const gpud::Options &o) { return gpud::vulkan::try_open(o); },
+     vulkan_saxpy},
 #endif
 #ifdef GPUD_HAS_SDL
-    {"sdl", [] { return gpud::sdl::try_open(); }, sdl_saxpy},
+    {"sdl", [] { return gpud::sdl::try_open(); },
+     [](const gpud::Options &o) { return gpud::sdl::try_open(o); },
+     sdl_saxpy},
 #endif
 };
 
@@ -286,6 +292,69 @@ TEST_P(Conformance, TimelineIsSafeToPollFromAnotherThread) {
     stop.store(true, std::memory_order_relaxed);
     poller.join();
     EXPECT_GT(samples.load(), 0) << "poller never ran";
+}
+
+// max_queued bounds the tickets outstanding: submitted minus completed
+// never exceeds it. One-sided on purpose — a fast device may never
+// accumulate the bound, so the assertion is "never exceeds", and the
+// throttle's firing was proven by removing it once (commit message).
+TEST_P(Conformance, ThrottleBoundsOutstanding) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    auto capped = GetParam().open_with(gpud::Options{.max_queued = 4});
+    if (!capped) GTEST_SKIP() << "reopen with options failed";
+    gpud::Device &dev = *capped;
+
+    constexpr std::uint32_t N = 1u << 20; // enough work to stay queued
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    const SaxpyScalars sc{1.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &a};
+
+    for (int i = 0; i < 20; ++i) {
+        dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+        EXPECT_LE(dev.submitted().value - dev.completed().value, 4u)
+            << "outstanding exceeded max_queued at dispatch " << i;
+    }
+    dev.flush();
+    EXPECT_EQ(dev.completed(), dev.submitted());
+}
+
+// Two threads wait() overlapping tickets while a third dispatches: a
+// wait(t) must not return before t completes, even when another
+// waiter holds the fence prefix covering t — a fence, unlike a
+// timeline value, can be waited only by whoever holds it, and the
+// backend must bridge that gap.
+TEST_P(Conformance, ConcurrentWaitersAllObserveCompletion) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    gpud::Device &dev = *dev_;
+
+    constexpr std::uint32_t N = 1u << 18;
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    const SaxpyScalars sc{1.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &a};
+
+    std::atomic<std::uint64_t> latest{0};
+    std::atomic<bool> stop{false};
+    auto waiter = [&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            const std::uint64_t t = latest.load(std::memory_order_acquire);
+            if (!t) continue;
+            dev.wait(gpud::Ticket{t});
+            EXPECT_GE(dev.completed(), gpud::Ticket{t});
+        }
+    };
+    std::thread w1(waiter), w2(waiter);
+    for (int i = 0; i < 200; ++i) {
+        const gpud::Ticket t = dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+        latest.store(t.value, std::memory_order_release);
+    }
+    dev.flush();
+    stop.store(true, std::memory_order_relaxed);
+    w1.join();
+    w2.join();
 }
 
 // run() names the tick it occupies: equal to submitted() right after,

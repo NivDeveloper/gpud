@@ -312,7 +312,9 @@ std::unique_ptr<Device> open_default() {
   device timeline below is built, and with it a narrow thread-safety
   carve-out. Streams remain deliberately absent — the answer to queue
   parallelism is still "open two Devices".)*
-- **Blocking submission.** *(Closed. The Vulkan backend batches; see
+- **Blocking submission.** *(Closed for both real backends: vulkan
+  batches on a timeline semaphore, sdl submits per dispatch onto a
+  fence ring; see
   the device timeline below.)*
 
 ## Finer-grained synchronization: the device timeline (BUILT, 2026-08)
@@ -445,3 +447,22 @@ Sequencing and contract notes, borne out in the build:
   barrier rests on the spec argument above; the tests cover chaining,
   batch boundaries and throttling, which is a different thing and worth
   not confusing with it.
+- **The SDL backend joined (v0.6), and what forced it.** Beside a
+  presenting renderer on the shared device a fence wait costs a
+  display refresh — measured 15.26 ms per dispatch against 0.16 ms
+  uncontended, which took a consumer's sim from 1020 sweeps/s to 9 —
+  and the blocking run() paid it once per dispatch. run() now submits
+  and keeps the fence on a ring; the ticket is claimed only after a
+  SUCCESSFUL submit (an SDL fence bakes in no value, so the
+  failed-submit host-signal trap does not arise); completed() answers
+  from an atomic mirror behind a try_lock and never blocks; wait()
+  loops on a condition variable, because a fence ring — unlike a
+  timeline value — is not waiter-independent and another waiter may
+  hold the prefix. No last_use and no defer_release: the one in-order
+  queue plus SDL's pass-boundary hazard tracking order run→run and
+  run→read, read() still waits its own fence, and buffer teardown
+  rides SDL's deferred free, since everything gpud recorded was
+  submitted. write() is the one that changed: it drains outstanding
+  dispatches first — SDL's header forbids overwriting referenced
+  data, and cycling would rotate the internal resource out from under
+  native_buffer() handles.

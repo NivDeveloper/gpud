@@ -10,14 +10,14 @@ namespace gpud::sdl {
 
 class Device;
 
-// A blocking backend: every run() has fully completed before it
-// returns, so the "memory stays alive while work is queued" half of
-// the lifetime contract is vacuous for gpud's OWN work and the
-// destructor releases immediately. It says nothing about a renderer's
-// command buffer on the shared device: SDL defers the real free past
-// work already SUBMITTED that references the buffer, and a handle
-// bound into a command buffer not yet submitted is the consumer's to
-// keep alive (BufferSource's thread rule).
+// The handle may die while gpud's own dispatches still reference the
+// memory: every such dispatch was SUBMITTED before run() returned, and
+// SDL_ReleaseGPUBuffer defers the real free until submitted work that
+// references the buffer completes — the async ring needs no lifetime
+// bookkeeping of its own. What SDL's deferral does NOT cover is a
+// renderer's command buffer recorded but not yet submitted on the
+// shared device; that handle is the consumer's to keep alive
+// (BufferSource's thread rule).
 struct BufferImpl final : ::gpud::Buffer::Impl {
     SDL_GPUDevice *dev = nullptr; // non-owning; the Device outlives us
     SDL_GPUBuffer *buf = nullptr;

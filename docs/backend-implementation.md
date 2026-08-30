@@ -84,12 +84,16 @@ right way to *start*. When a backend outgrows it, the three pieces
 arrive together, because they are all the same question — *has the work
 touching this memory completed?*
 
-1. **A timeline**, implementing `submitted`/`completed`/`wait`. Every
-   backend has the primitive (docs/design.md has the table): Vulkan a
-   timeline `VkSemaphore`, Metal an `MTLSharedEvent`, CUDA an in-order
-   stream plus an event per value. Leave the base-class defaults alone
-   until then — they say "nothing is ever outstanding", which is exactly
-   true of a blocking backend.
+1. **A timeline**, implementing `submitted`/`completed`/`wait` (all
+   speaking `Ticket`, the one-field value type; run() returns the
+   Ticket it occupies). Every backend has the primitive (docs/design.md
+   has the table): Vulkan a timeline `VkSemaphore`, Metal an
+   `MTLSharedEvent`, CUDA an in-order stream plus an event per value,
+   SDL a ring of `SDL_GPUFence`s — with the caveat that a fence, unlike
+   a value, is waited by whoever HOLDS it, so concurrent waiters need a
+   condition variable bridging the gap. Leave the base-class defaults
+   alone until then — they say "nothing is ever outstanding", which is
+   exactly true of a blocking backend.
 2. **Deferred release**: a FIFO of closures keyed by ticket, drained
    oldest-first and stopping at the first not complete. A Buffer handle
    may die while queued work still reads its memory; its Impl's
@@ -265,14 +269,21 @@ in auto-selection — native backends first.
   both at pipeline creation and gpud carries no reflection. Legitimate
   only because the dialect is self-describing; the scan is part of the
   dialect pact.
-- v1 execution is FULLY BLOCKING (submit + fence wait in run, write
-  and read), so the base timeline defaults stand and buffer teardown
-  releases immediately — for gpud's own work. A renderer's command
-  buffer on the shared device is outside that sentence: SDL defers
-  the free past SUBMITTED work, and a handle bound but not yet
-  submitted is the consumer's to keep alive (BufferSource's thread
-  rule in Device.h). Batching = fences ring + tickets, the vulkan
-  shape, when a consumer's frame loop needs it.
+- run() is ASYNC on a fence ring (v0.6): submit, keep the fence, claim
+  the ticket only after success (an SDL fence bakes in no value, so
+  the failed-submit host-signal trap does not arise); completed()
+  advances by non-blocking queries behind a try_lock; max_queued
+  throttles. write() drains outstanding dispatches before its upload —
+  the header forbids overwriting referenced data, and cycling would
+  rotate the resource out from under native_buffer() handles — while
+  read() keeps its own submit + fence wait, ordered by the one
+  in-order queue. Buffer teardown stays SDL's deferred free: every
+  gpud dispatch referencing it was submitted before the handle could
+  die. A renderer's command buffer recorded but not yet submitted on
+  the shared device remains the consumer's to keep alive
+  (BufferSource's thread rule in Device.h). What forced async: beside
+  a presenting renderer a fence wait costs a display refresh
+  (~15 ms measured vs 0.16 ms alone), once per dispatch.
 - try_open probes: SDL_InitSubSystem (ref-counted, paired in
   ~Device), the SDL_VULKAN_LIBRARY hint filled from
   /usr/local//opt/homebrew when unset (SDL dlopens the loader by bare

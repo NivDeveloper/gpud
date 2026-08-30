@@ -10,7 +10,7 @@ implemented backends. Vulkan: volk-loaded, BDA push-constant ABI
 semaphore with deferred release and VMA allocation; works on MoltenVK
 with zero Apple-specific code. SDL_GPU: slot-bound ABI ("slang-slot"),
 slangc → SPIR-V resolved lazily at first compile (bring-up needs no
-toolchain), fully blocking v1 (base timeline defaults), native
+toolchain), async run() on a fence ring behind the ticket timeline, native
 SDL_GPUDevice/SDL_GPUBuffer handle export for renderer sharing;
 BufferSource + the source_of ADL protocol (Device.h) are the
 pull-model interchange vocabulary; current() runs on the consumer's
@@ -124,10 +124,16 @@ convention — scalars behind a named ConstantBuffer); SDL declares a
 pipeline's resource counts and threadgroup size at creation and gpud
 carries no reflection, so do_compile SCANS THE SOURCE for its
 declarations — legitimate only because the dialect is self-describing,
-and part of the dialect pact; v1 is fully blocking (submit + fence
-wait per run/write/read; the base timeline defaults are then correct —
-do not override them until batching lands — and "releases immediately"
-covers gpud's own work, not a renderer's command buffer); try_open points
+and part of the dialect pact; run() is ASYNC (v0.6): submit + fence
+onto a ring, the ticket claimed only AFTER a successful submit (an SDL
+fence bakes in no value, so vulkan's failed-submit host-signal trap
+does not arise), wait() looping on a condition variable because a
+fence ring is not waiter-independent, completed() answering from an
+atomic mirror behind a try_lock so it never blocks; write() drains
+outstanding dispatches before its upload (SDL forbids overwriting
+referenced data, and cycling would rotate the resource out from under
+native_buffer() handles) while read() needs only its own fence on the
+in-order queue; try_open points
 SDL_VULKAN_LIBRARY at a /usr/local or /opt/homebrew loader when unset
 (SDL dlopens by bare name and misses /usr/local/lib; a user's env
 wins); SDL_InitSubSystem/SDL_QuitSubSystem are ref-counted and paired

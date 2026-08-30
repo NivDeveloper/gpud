@@ -1,10 +1,13 @@
-// try_open (device bring-up), run (one blocking dispatch), and the
-// native-handle accessors.
+// try_open (device bring-up), the async run(), the fence ring behind
+// the ticket timeline, and the native-handle accessors.
 //
-// v1 is FULLY BLOCKING: every run() submits and waits before returning,
-// which the ordering contract explicitly permits. The base-class
-// timeline defaults (submitted/completed pinned at 0) are then the
-// truth; batching on fences is the known later optimization.
+// run() submits and returns; the fence rides a ring the reclaimer
+// drains. Waits happen only where the host observes: read(), a write()
+// into storage queued work may still touch, wait()/flush(), the
+// max_queued throttle, and teardown. What forced this: beside a
+// presenting renderer on the shared device a fence wait costs a
+// display refresh (~15 ms measured, vs 0.16 ms uncontended), and a
+// blocking run() paid it once per dispatch.
 
 #include "Device.h"
 
@@ -15,6 +18,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
@@ -33,6 +37,7 @@ void log(const char *msg) {
 
 std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     Device::State s;
+    s.max_queued = opts.max_queued < 1 ? 1 : opts.max_queued;
 
     // SDL has no device-selection hook on SDL_CreateGPUDevice; the
     // driver picks. -1 and 0 both mean "the obvious one".
@@ -71,9 +76,14 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
 
 
 Device::~Device() {
-    // Blocking run() leaves nothing in flight, but a driver may hold
-    // internal work; idle before releasing anything.
+    // Idle first, then force-reclaim: after the idle every ring fence
+    // is signalled, so releasing without querying is safe, and the
+    // ring must empty before the device dies.
     SDL_WaitForGPUIdle(s_.dev);
+    {
+        std::unique_lock lock(m_);
+        reclaim_locked(true);
+    }
     clear_kernels(); // KernelImpls hold pipelines — before the device
     SDL_DestroyGPUDevice(s_.dev);
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
@@ -88,6 +98,10 @@ Ticket Device::run(const Kernel &kernel, std::size_t groups,
             "gpud/sdl: kernel binds 1 output + " +
             std::to_string(k.n_readonly) + " inputs but run() was given " +
             std::to_string(buffers.size()) + " buffers");
+
+    std::unique_lock lock(m_);
+    reclaim_locked(false);
+    throttle_locked(lock);
 
     SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(s_.dev);
     if (!cmd)
@@ -111,13 +125,106 @@ Ticket Device::run(const Kernel &kernel, std::size_t groups,
     SDL_DispatchGPUCompute(pass, Uint32(groups), 1, 1);
     SDL_EndGPUComputePass(pass);
 
+    // The ticket is claimed only AFTER a successful submit: an SDL
+    // fence bakes in no value (unlike a recorded timeline signal), so
+    // a failed submit throws with nothing promised and there is no
+    // never-signalled ticket to host-signal.
     SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
     if (!fence)
         throw std::runtime_error(std::string("gpud/sdl: submit: ") +
                                  SDL_GetError());
-    SDL_WaitForGPUFences(s_.dev, true, &fence, 1);
-    SDL_ReleaseGPUFence(s_.dev, fence);
-    return {ticket_.fetch_add(1, std::memory_order_release) + 1};
+    const std::uint64_t ticket =
+        submitted_.load(std::memory_order_relaxed) + 1;
+    pending_.push_back({ticket, fence});
+    submitted_.store(ticket, std::memory_order_release);
+    return {ticket};
+}
+
+// Retire what the GPU has finished with, oldest first: fences signal
+// in submission order on the one queue, so the first not-done means
+// none behind it are either. `force` skips the query — teardown only,
+// after the device idled, where every fence is already signalled.
+void Device::reclaim_locked(bool force) const {
+    bool advanced = false;
+    while (!pending_.empty() &&
+           (force || SDL_QueryGPUFence(s_.dev, pending_.front().fence))) {
+        SDL_ReleaseGPUFence(s_.dev, pending_.front().fence);
+        completed_.store(pending_.front().ticket, std::memory_order_release);
+        pending_.pop_front();
+        advanced = true;
+    }
+    if (advanced) cv_.notify_all();
+}
+
+Ticket Device::completed() const {
+    // "Poll and never block" (the contract): when another thread holds
+    // the lock, answer with the last published value rather than wait
+    // behind its record+submit.
+    if (std::unique_lock lock(m_, std::try_to_lock); lock)
+        reclaim_locked(false);
+    return {completed_.load(std::memory_order_acquire)};
+}
+
+void Device::wait(Ticket ticket) {
+    std::unique_lock lock(m_);
+    wait_locked(lock, ticket.value);
+}
+
+// A fence ring is not waiter-independent: a fence can be waited only
+// by whoever holds it, while the contract lets two threads wait()
+// concurrently. So a waiter whose tickets were already popped by
+// ANOTHER in-flight waiter loops on the condition variable until that
+// waiter relocks and publishes — returning early there was the bug
+// this shape exists to prevent.
+void Device::wait_locked(std::unique_lock<std::mutex> &lock,
+                         std::uint64_t ticket) {
+    // Clamp rather than hang: a ticket beyond the last one issued
+    // would wait on a fence that does not exist.
+    const std::uint64_t issued = submitted_.load(std::memory_order_relaxed);
+    if (ticket > issued) ticket = issued;
+    if (ticket == 0) return;
+
+    while (completed_.load(std::memory_order_relaxed) < ticket) {
+        if (pending_.empty() || pending_.front().ticket > ticket) {
+            cv_.wait(lock);
+            continue;
+        }
+
+        // Take ownership of our prefix under the lock, wait outside it.
+        std::vector<InFlight> mine;
+        while (!pending_.empty() && pending_.front().ticket <= ticket) {
+            mine.push_back(pending_.front());
+            pending_.pop_front();
+        }
+        std::vector<SDL_GPUFence *> fences;
+        fences.reserve(mine.size());
+        for (const InFlight &f : mine) fences.push_back(f.fence);
+        lock.unlock();
+        const bool ok = SDL_WaitForGPUFences(s_.dev, true, fences.data(),
+                                             Uint32(fences.size()));
+        lock.lock();
+        for (const InFlight &f : mine) SDL_ReleaseGPUFence(s_.dev, f.fence);
+
+        // Publish before any throw: the fences are gone, so nothing
+        // could ever complete these tickets again, and a stuck
+        // completed_ would strand every other waiter on the cv.
+        if (completed_.load(std::memory_order_relaxed) < mine.back().ticket)
+            completed_.store(mine.back().ticket, std::memory_order_release);
+        cv_.notify_all();
+        if (!ok)
+            throw std::runtime_error(std::string("gpud/sdl: wait: ") +
+                                     SDL_GetError());
+    }
+}
+
+// Bound the queued work: at most max_queued tickets outstanding, which
+// bounds ring fences and, through SDL's deferred frees, zombie memory.
+// Costs one stall per max_queued dispatches.
+void Device::throttle_locked(std::unique_lock<std::mutex> &lock) {
+    const std::uint64_t issued = submitted_.load(std::memory_order_relaxed);
+    if (issued - completed_.load(std::memory_order_relaxed) < s_.max_queued)
+        return;
+    wait_locked(lock, issued - s_.max_queued + 1);
 }
 
 SDL_GPUDevice *native_device(::gpud::Device &dev) {
