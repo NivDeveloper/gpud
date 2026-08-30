@@ -47,7 +47,7 @@ points SDL at a /usr/local or /opt/homebrew loader when the
 include(FetchContent)
 FetchContent_Declare(gpud
   GIT_REPOSITORY https://github.com/NivDeveloper/gpud
-  GIT_TAG v0.5.1)   # ← pin a release; bump this line to update
+  GIT_TAG v0.6.0)   # ← pin a release; bump this line to update
 FetchContent_MakeAvailable(gpud)
 
 target_link_libraries(app PRIVATE gpud::auto_)   # underscore: `auto` is a keyword
