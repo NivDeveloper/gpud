@@ -27,12 +27,16 @@
 
 namespace gpud::vulkan {
 
-// Error contract: failures after a successful try_open throw.
+// Error contract: failures after a successful try_open throw. A lost
+// device gets its own sentence — the one VkResult a user can act on.
+std::string device_lost_sentence(const char *what);
+
 inline void check(VkResult r, const char *what) {
-    if (r != VK_SUCCESS)
-        throw std::runtime_error(std::string("gpud/vulkan: ") + what +
-                                 " failed (VkResult " + std::to_string(r) +
-                                 ")");
+    if (r == VK_SUCCESS) return;
+    if (r == VK_ERROR_DEVICE_LOST)
+        throw std::runtime_error(device_lost_sentence(what));
+    throw std::runtime_error(std::string("gpud/vulkan: ") + what +
+                             " failed (VkResult " + std::to_string(r) + ")");
 }
 
 class Device final : public ::gpud::Device {
@@ -51,6 +55,8 @@ class Device final : public ::gpud::Device {
         VmaAllocator allocator{};
         std::uint32_t max_queued{};   // Options::max_queued, clamped to >= 1
         std::uint32_t batch{};        // Options::batch, clamped to [1, max_queued]
+        std::uint64_t wait_ns{};      // Options::wait_ms (GPUD_WAIT_MS wins);
+                                      // 0 = every host wait is unbounded
         std::string slangc;      // resolved at FIRST compile; empty until
         bool owned = true;       // try_open created device+instance;
                                  // try_open_on adopts and never destroys
@@ -140,6 +146,10 @@ class Device final : public ::gpud::Device {
     void submit_batch_locked();
 
     void wait_locked(std::unique_lock<std::mutex> &lock, std::uint64_t ticket);
+
+    // What a host wait past the bound says: the ticket, where the
+    // timeline stood, and the two things it can mean.
+    std::string hung_sentence(std::uint64_t ticket) const;
 
     // Bound the queued work: at most max_queued_ tickets outstanding.
     void throttle_locked(std::unique_lock<std::mutex> &lock);

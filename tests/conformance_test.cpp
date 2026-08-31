@@ -1049,4 +1049,127 @@ TEST(VulkanLazySlangc, OpensWithoutCompilerAndCompileThrowsByName) {
 #endif
 }
 
+namespace {
+
+// Queue kDepth heavy dispatches (8 of them measured 9-14 ms on an Apple
+// M4 Pro through MoltenVK; seconds on lavapipe) and wait for the last
+// with the bound the device was opened with. `expect` names the bound
+// the sentence must quote.
+void expect_hung_wait(gpud::Device &dev, unsigned expect_ms) {
+    constexpr std::uint32_t N = 1 << 16;
+    constexpr int kDepth = 8;
+    const gpud::Kernel &heavy = dev.compile(vulkan_saxpy_heavy);
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &b};
+    gpud::Ticket last;
+    for (int i = 0; i < kDepth; ++i)
+        last = dev.run(heavy, (N + 63) / 64, blob_of(sc), buffers);
+
+    try {
+        dev.wait(last);
+        FAIL() << "a " << expect_ms << " ms bound on " << kDepth
+               << " heavy dispatches must trip";
+    } catch (const std::runtime_error &e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("waited " + std::to_string(expect_ms) +
+                            " ms for ticket " + std::to_string(last.value)),
+                  std::string::npos)
+            << what;
+        EXPECT_NE(what.find("GPUD_WAIT_MS"), std::string::npos) << what;
+    }
+
+    // The throw promised nothing about the work, which still completes;
+    // the timeline settles on its own and the Device stays usable. The
+    // bound is still 1 ms, so every later wait is polled to completion
+    // first — a plain saxpy's submit-to-signal alone can exceed 1 ms.
+    const auto settle = [&](gpud::Ticket t) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (dev.completed() < t) {
+            ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+                << "the dispatches the wait gave up on never completed";
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    settle(last);
+    const gpud::Kernel &k = dev.compile(vulkan_saxpy);
+    std::vector<float> in(N, 1.0f), out(N);
+    dev.write(a, in.data(), N * sizeof(float));
+    dev.write(b, in.data(), N * sizeof(float));
+    const gpud::Ticket t = dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    dev.submit();
+    settle(t);
+    dev.read(o, out.data(), N * sizeof(float));
+    EXPECT_EQ(out[0], 3.0f) << "the Device must work after a tripped wait";
+    EXPECT_EQ(out[N - 1], 3.0f);
+}
+
+} // namespace
+
+// A host wait is unbounded unless Options::wait_ms bounds it; past the
+// bound wait() throws a sentence naming the ticket and the bound, and
+// the Device survives the throw.
+TEST(VulkanBounded, WaitPastTheBoundThrowsAndTheDeviceSurvives) {
+    auto dev = gpud::vulkan::try_open(gpud::Options{.wait_ms = 1});
+    if (!dev) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+    expect_hung_wait(*dev, 1);
+}
+
+// GPUD_WAIT_MS overrides the field — a gate bounds a program that never
+// set it.
+TEST(VulkanBounded, EnvironmentOverridesTheField) {
+#ifdef _WIN32
+    _putenv_s("GPUD_WAIT_MS", "1");
+#else
+    setenv("GPUD_WAIT_MS", "1", 1);
+#endif
+    auto dev = gpud::vulkan::try_open(gpud::Options{.wait_ms = 0});
+#ifdef _WIN32
+    _putenv_s("GPUD_WAIT_MS", "");
+#else
+    unsetenv("GPUD_WAIT_MS");
+#endif
+    if (!dev) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+    expect_hung_wait(*dev, 1);
+}
+
+namespace {
+
+// What the death test's child runs: heavy work in flight, then a
+// teardown bounded at 1 ms. Braces inside a macro argument are not
+// parenthesized, hence a function.
+void teardown_past_the_bound() {
+    auto dev = gpud::vulkan::try_open(gpud::Options{.wait_ms = 1});
+    constexpr std::uint32_t N = 1 << 16;
+    const gpud::Kernel &heavy = dev->compile(vulkan_saxpy_heavy);
+    gpud::Buffer a = dev->alloc(N * sizeof(float));
+    gpud::Buffer b = dev->alloc(N * sizeof(float));
+    gpud::Buffer o = dev->alloc(N * sizeof(float));
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &b};
+    for (int i = 0; i < 8; ++i)
+        dev->run(heavy, (N + 63) / 64, blob_of(sc), buffers);
+    dev->submit();
+    dev.reset();
+}
+
+} // namespace
+
+// Teardown cannot throw: past the bound it prints the sentence and
+// aborts, because nothing it owns can be destroyed while the device may
+// still be using it. A threadsafe death test re-runs this binary, so the
+// child brings up its own device.
+TEST(VulkanBoundedDeath, TeardownPastTheBoundAbortsWithTheSentence) {
+    {
+        auto probe = gpud::vulkan::try_open();
+        if (!probe) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+    }
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    EXPECT_DEATH(teardown_past_the_bound(),
+                 "gpud/vulkan: waited 1 ms for ticket");
+}
+
 #endif

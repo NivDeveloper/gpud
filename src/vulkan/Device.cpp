@@ -41,6 +41,12 @@ std::unique_ptr<::gpud::Device> open_common(Device::State &s,
                                             const Options &opts) {
     s.batch = opts.batch < 1 ? 1 : opts.batch;
     if (s.batch > s.max_queued) s.batch = s.max_queued;
+    // The environment wins over the field: a gate must be able to
+    // bound a program that never set it.
+    std::uint64_t wait_ms = opts.wait_ms;
+    if (const char *env = std::getenv("GPUD_WAIT_MS"); env && *env)
+        wait_ms = std::strtoull(env, nullptr, 10);
+    s.wait_ns = wait_ms * 1000000ull;
     const auto common_fail =
         [&](const char *why) -> std::unique_ptr<::gpud::Device> {
         log(why);
@@ -288,6 +294,21 @@ std::uint64_t native_timeline(::gpud::Device &dev) {
 Device::~Device() {
     // Nothing else may touch a dying Device (handles don't outlive it,
     // and the thread-safe corner is for live devices), so no lock here.
+    // The bound applies here too, and a destructor cannot throw: past
+    // it the sentence goes to stderr and the process aborts, because
+    // nothing below can be destroyed while the device may still be
+    // using it — an abort that says why is what a hang would hide.
+    if (s.wait_ns && last_submitted_) {
+        VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wi.semaphoreCount = 1;
+        wi.pSemaphores = &s.timeline;
+        wi.pValues = &last_submitted_;
+        if (vkWaitSemaphores(s.device, &wi, s.wait_ns) == VK_TIMEOUT) {
+            std::fprintf(stderr, "%s\n",
+                         hung_sentence(last_submitted_).c_str());
+            std::abort();
+        }
+    }
     // Idle OUR queue, not the device: on an adopted device a
     // vkDeviceWaitIdle would stall the app's other queues too.
     q_lock();
@@ -348,11 +369,34 @@ void Device::wait_locked(std::unique_lock<std::mutex> &lock,
         // Unlocked across the block: this is the only long wait, and
         // holding m_ through it would stall every other thread's poll.
         lock.unlock();
-        const VkResult r = vkWaitSemaphores(s.device, &wi, UINT64_MAX);
+        const VkResult r = vkWaitSemaphores(
+            s.device, &wi, s.wait_ns ? s.wait_ns : UINT64_MAX);
         lock.lock();
+        if (r == VK_TIMEOUT) throw std::runtime_error(hung_sentence(ticket));
         check(r, "vkWaitSemaphores");
     }
     reclaim_locked(false);
+}
+
+std::string Device::hung_sentence(std::uint64_t ticket) const {
+    // completed() may itself throw — a lost device — and that is the
+    // better sentence, so it is not caught here.
+    return "gpud/vulkan: waited " + std::to_string(s.wait_ns / 1000000ull) +
+           " ms for ticket " + std::to_string(ticket) + " (completed " +
+           std::to_string(completed().value) + ", submitted " +
+           std::to_string(submitted_.load(std::memory_order_relaxed)) +
+           ", last submitted " + std::to_string(last_submitted_) +
+           "): a dispatch still running, or a value nothing will ever "
+           "signal — a wait on work that was never submitted; "
+           "Options::wait_ms / GPUD_WAIT_MS set the bound (0 = unbounded)";
+}
+
+std::string device_lost_sentence(const char *what) {
+    return std::string("gpud/vulkan: ") + what +
+           ": the device was lost (VK_ERROR_DEVICE_LOST) — a kernel "
+           "faulted, ran past a buffer's end, or a buffer was destroyed "
+           "while a dispatch still used it; GPU-assisted validation names "
+           "the kernel, Metal's debug layer the object";
 }
 
 void Device::submit() {

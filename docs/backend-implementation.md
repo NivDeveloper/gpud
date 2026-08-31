@@ -137,7 +137,14 @@ concurrent `wait()` can submit a batch promising work that was never
 recorded. **Failed submission:** tickets are handed out at record time,
 so if the submit fails nothing will ever signal them and every later
 wait — teardown included — hangs; signal the timeline from the host
-before rethrowing.
+before rethrowing. **Bounded waits (0.9):** every host wait takes
+`Options::wait_ms` (the environment's `GPUD_WAIT_MS` wins) as its
+timeout, unbounded at 0; `VK_TIMEOUT` becomes the hung sentence —
+thrown from `wait()`, printed and aborted from the destructor — and
+`VK_ERROR_DEVICE_LOST` its own sentence in `check()`. What the bound
+catches is not slow work but a wait on a value nothing will signal:
+the class of bug `submit()` exists to prevent, which a hang otherwise
+hides from every gate.
 
 ## Vulkan (first, in full) — IMPLEMENTED as planned
 

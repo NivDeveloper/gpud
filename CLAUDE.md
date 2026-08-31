@@ -58,7 +58,14 @@ cuda/metal remain scaffolding stubs (try_open returns nullptr).
   carve-out. Submission is EAGER (0.8): a batch of Options::batch
   dispatches goes out when full, a shorter one waits for an observer
   or submit(); max_queued is only the bound and wants to be at least
-  twice the batch.
+  twice the batch. Every host wait is UNBOUNDED unless
+  Options::wait_ms bounds it (GPUD_WAIT_MS overrides the field — a
+  gate bounds a program that never set it): past the bound wait()
+  throws the hung sentence — ticket, completed, submitted, last
+  submitted, the two things it can mean — and teardown prints it and
+  aborts, since a destructor cannot throw and nothing it owns can be
+  freed under a device that may still be using it. A lost device
+  throws its own sentence from check().
 - **Fresh allocations are unspecified.** alloc() may hand back memory a
   destroyed Buffer owned, so its contents are undefined — write before
   reading. Conversely a Buffer may be destroyed while work using it is

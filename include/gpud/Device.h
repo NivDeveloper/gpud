@@ -51,7 +51,10 @@
 //     they return nullptr when the backend can't come up, for any reason
 //     (set GPUD_LOG=1 for a stderr line saying why). Once a Device is
 //     open, failed operations throw std::runtime_error — kernel compile
-//     errors carry the compiler diagnostics verbatim.
+//     errors carry the compiler diagnostics verbatim, a lost device
+//     says what loses one, and a host wait past Options::wait_ms says
+//     what it waited for. Every host wait is unbounded unless that
+//     bound is set.
 
 #include <compare>
 #include <cstddef>
@@ -97,6 +100,19 @@ struct Options {
     // growing indefinitely. Backends that allocate per buffer, with no
     // pool to bound, ignore it.
     std::size_t pool_budget_bytes = 0;
+
+    // Bound, in milliseconds, on every host wait for the device —
+    // wait()/flush(), a read() or write() behind queued work, the
+    // max_queued throttle, teardown; 0 = unbounded, the default. Past
+    // it the call throws a sentence naming the ticket waited for and
+    // where the timeline stood (teardown, which cannot throw, prints
+    // it and aborts): either a dispatch is still running, or the value
+    // will never be signalled — a wait on work that was never
+    // submitted, the failure a hang otherwise hides. A GATE sets it
+    // (the environment variable GPUD_WAIT_MS overrides this field, so
+    // a test run can bound a program that never set it); a program
+    // whose dispatches legitimately run long leaves it 0.
+    std::uint32_t wait_ms = 0;
 };
 
 // Move-only RAII handle to a device allocation. Backends subclass Impl;
