@@ -63,7 +63,7 @@ cuda/metal remain scaffolding stubs (try_open returns nullptr).
   gate bounds a program that never set it): past the bound wait()
   throws the hung sentence — ticket, completed, submitted, last
   submitted, the two things it can mean — and teardown prints it and
-  aborts, since a destructor cannot throw and nothing it owns can be
+  exits, since a destructor cannot throw and nothing it owns can be
   freed under a device that may still be using it. A lost device
   throws its own sentence from check().
 - **Fresh allocations are unspecified.** alloc() may hand back memory a

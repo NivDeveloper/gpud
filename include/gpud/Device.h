@@ -106,7 +106,7 @@ struct Options {
     // max_queued throttle, teardown; 0 = unbounded, the default. Past
     // it the call throws a sentence naming the ticket waited for and
     // where the timeline stood (teardown, which cannot throw, prints
-    // it and aborts): either a dispatch is still running, or the value
+    // it and exits): either a dispatch is still running, or the value
     // will never be signalled — a wait on work that was never
     // submitted, the failure a hang otherwise hides. A GATE sets it
     // (the environment variable GPUD_WAIT_MS overrides this field, so

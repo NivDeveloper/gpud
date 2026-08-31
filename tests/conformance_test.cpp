@@ -1159,7 +1159,7 @@ void teardown_past_the_bound() {
 } // namespace
 
 // Teardown cannot throw: past the bound it prints the sentence and
-// aborts, because nothing it owns can be destroyed while the device may
+// exits, because nothing it owns can be destroyed while the device may
 // still be using it. A threadsafe death test re-runs this binary, so the
 // child brings up its own device.
 TEST(VulkanBoundedDeath, TeardownPastTheBoundAbortsWithTheSentence) {

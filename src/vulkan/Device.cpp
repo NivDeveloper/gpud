@@ -295,9 +295,11 @@ Device::~Device() {
     // Nothing else may touch a dying Device (handles don't outlive it,
     // and the thread-safe corner is for live devices), so no lock here.
     // The bound applies here too, and a destructor cannot throw: past
-    // it the sentence goes to stderr and the process aborts, because
+    // it the sentence goes to stderr and the process ends, because
     // nothing below can be destroyed while the device may still be
-    // using it — an abort that says why is what a hang would hide.
+    // using it. _Exit, not abort: the sentence is the diagnosis, exit
+    // handlers would wait on the same device, and a gate reads an exit
+    // code where it cannot read a signal.
     if (s.wait_ns && last_submitted_) {
         VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         wi.semaphoreCount = 1;
@@ -306,7 +308,7 @@ Device::~Device() {
         if (vkWaitSemaphores(s.device, &wi, s.wait_ns) == VK_TIMEOUT) {
             std::fprintf(stderr, "%s\n",
                          hung_sentence(last_submitted_).c_str());
-            std::abort();
+            std::_Exit(EXIT_FAILURE);
         }
     }
     // Idle OUR queue, not the device: on an adopted device a
@@ -394,9 +396,10 @@ std::string Device::hung_sentence(std::uint64_t ticket) const {
 std::string device_lost_sentence(const char *what) {
     return std::string("gpud/vulkan: ") + what +
            ": the device was lost (VK_ERROR_DEVICE_LOST) — a kernel "
-           "faulted, ran past a buffer's end, or a buffer was destroyed "
-           "while a dispatch still used it; GPU-assisted validation names "
-           "the kernel, Metal's debug layer the object";
+           "faulted, ran past a buffer's end, a buffer was destroyed while "
+           "a dispatch still used it, or a queue waited on a value nothing "
+           "signalled until the driver's watchdog gave up; GPU-assisted "
+           "validation names the kernel, Metal's debug layer the object";
 }
 
 void Device::submit() {
