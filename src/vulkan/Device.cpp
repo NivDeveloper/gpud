@@ -462,6 +462,13 @@ std::string device_lost_sentence(const char *what) {
 
 std::size_t Device::take_timings(std::span<BatchTiming> out) {
     std::lock_guard lock(m_);
+    // Poll first: a producer that stopped dispatching never reclaims
+    // again, and its last batches' stamps would otherwise stay unread.
+    // Only the pending half — deferred releases stay with reclaim.
+    if (s.profile) {
+        completed_cache_ = completed().value;
+        collect_pending_locked(completed_cache_, false);
+    }
     std::size_t n = 0;
     while (n < out.size() && !timings_.empty()) {
         out[n++] = timings_.front();
@@ -534,6 +541,10 @@ void Device::reclaim_locked(bool force) {
         deferred_.pop_front();
         run_deferred_locked(d, force);
     }
+    collect_pending_locked(done, force);
+}
+
+void Device::collect_pending_locked(std::uint64_t done, bool force) {
     // Stamps are read in batch order, never waited for: the first one
     // the driver has not published yet stops the pass, and the rest
     // wait behind it for the next reclaim.

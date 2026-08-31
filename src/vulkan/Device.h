@@ -200,6 +200,9 @@ class Device final : public ::gpud::Device {
     // completion handler, after the semaphore); retried each reclaim.
     std::deque<InFlight> unread_;
     bool collect_timing_locked(const InFlight &);
+    // The pending half of reclaim: completed batches' stamps are read
+    // (or queued unread) and their command buffers freed.
+    void collect_pending_locked(std::uint64_t done, bool force);
 
     struct Deferred {
         std::uint64_t ticket;

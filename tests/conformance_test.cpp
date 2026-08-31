@@ -1174,11 +1174,17 @@ void expect_two_batch_timings(gpud::Device &dev) {
     const std::uint64_t before = dev.submitted().value;
     for (int i = 0; i < 8; ++i) dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
     dev.flush();
-    dev.run(k, 1, blob_of(sc), buffers);   // reclaim runs at the next run()
-    dev.flush();
+    // No further run(): take_timings polls for itself, so a producer
+    // that stopped still hands over its last batches (stamps a driver
+    // publishes late arrive on a later call).
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
 
     std::array<gpud::Device::BatchTiming, 8> got{};
-    const std::size_t n = dev.take_timings(got);
+    std::size_t n = dev.take_timings(got);
+    for (int tries = 0; n < 2 && tries < 100; ++tries) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        n += dev.take_timings(std::span(got).subspan(n));
+    }
     ASSERT_GE(n, std::size_t(2)) << "two full batches must report";
     EXPECT_EQ(got[0].first.value, before + 1);
     EXPECT_EQ(got[0].last.value, before + 4);
