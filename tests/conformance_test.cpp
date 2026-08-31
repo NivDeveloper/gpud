@@ -606,6 +606,202 @@ TEST(SdlInterop, NativeHandlesAreLive) {
 
 #ifdef GPUD_HAS_VULKAN
 
+#include <volk.h>
+
+// A raw device of the tests' own, to hand to try_open_on: the minimal
+// subset of the backend's bring-up (portability handled, first compute
+// family, the two features adoption documents as required).
+namespace vkraw {
+
+struct Raw {
+    VkInstance inst{};
+    VkPhysicalDevice phys{};
+    VkDevice dev{};
+    VkQueue q{};
+    std::uint32_t fam = ~0u;
+};
+
+bool bring_up(Raw &r) {
+    if (volkInitialize() != VK_SUCCESS) return false;
+    std::uint32_t n = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> ie(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, ie.data());
+    std::vector<const char *> exts;
+    VkInstanceCreateFlags fl = 0;
+    for (const auto &e : ie)
+        if (!std::strcmp(e.extensionName, "VK_KHR_portability_enumeration")) {
+            exts.push_back("VK_KHR_portability_enumeration");
+            fl |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+        }
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.apiVersion = VK_API_VERSION_1_2;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.flags = fl;
+    ici.pApplicationInfo = &app;
+    ici.enabledExtensionCount = std::uint32_t(exts.size());
+    ici.ppEnabledExtensionNames = exts.data();
+    if (vkCreateInstance(&ici, nullptr, &r.inst) != VK_SUCCESS) return false;
+    volkLoadInstance(r.inst);
+
+    n = 0;
+    vkEnumeratePhysicalDevices(r.inst, &n, nullptr);
+    if (!n) return false;
+    std::vector<VkPhysicalDevice> devs(n);
+    vkEnumeratePhysicalDevices(r.inst, &n, devs.data());
+    r.phys = devs[0];
+
+    n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &n, nullptr);
+    std::vector<VkQueueFamilyProperties> fams(n);
+    vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &n, fams.data());
+    for (std::uint32_t i = 0; i < n; ++i)
+        if (fams[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+            r.fam = i;
+            break;
+        }
+    if (r.fam == ~0u) return false;
+
+    const float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    qci.queueFamilyIndex = r.fam;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+    VkPhysicalDeviceVulkan12Features f12{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f12.bufferDeviceAddress = VK_TRUE;
+    f12.timelineSemaphore = VK_TRUE;
+    n = 0;
+    vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &n, nullptr);
+    std::vector<VkExtensionProperties> de(n);
+    vkEnumerateDeviceExtensionProperties(r.phys, nullptr, &n, de.data());
+    std::vector<const char *> dexts;
+    for (const auto &e : de)
+        if (!std::strcmp(e.extensionName, "VK_KHR_portability_subset"))
+            dexts.push_back("VK_KHR_portability_subset");
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.pNext = &f12;
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = std::uint32_t(dexts.size());
+    dci.ppEnabledExtensionNames = dexts.data();
+    if (vkCreateDevice(r.phys, &dci, nullptr, &r.dev) != VK_SUCCESS)
+        return false;
+    volkLoadDevice(r.dev);
+    vkGetDeviceQueue(r.dev, r.fam, 0, &r.q);
+    return true;
+}
+
+void destroy(Raw &r) {
+    if (r.dev) vkDestroyDevice(r.dev, nullptr);
+    if (r.inst) vkDestroyInstance(r.inst, nullptr);
+    r = {};
+}
+
+gpud::vulkan::AdoptDesc desc_of(const Raw &r) {
+    gpud::vulkan::AdoptDesc d;
+    d.instance = r.inst;
+    d.physical = r.phys;
+    d.device = r.dev;
+    d.queue = r.q;
+    d.queue_family = r.fam;
+    d.get_instance_proc_addr = vkGetInstanceProcAddr;
+    return d;
+}
+
+void saxpy_roundtrip(gpud::Device &dev) {
+    constexpr std::uint32_t N = 256;
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    std::vector<float> ha(N), hb(N);
+    for (std::uint32_t i = 0; i < N; ++i) ha[i] = float(i), hb[i] = 2.0f * i;
+    dev.write(a, ha.data(), N * sizeof(float));
+    dev.write(b, hb.data(), N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(vulkan_saxpy);
+    SaxpyScalars sc{3.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &b};
+    dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    std::vector<float> out(N);
+    dev.read(o, out.data(), N * sizeof(float));
+    for (std::uint32_t i : {0u, 1u, 255u})
+        ASSERT_FLOAT_EQ(out[i], float(i) + 3.0f * (2.0f * i));
+}
+
+} // namespace vkraw
+
+TEST(VulkanAdopt, RefusesNullHandles) {
+    EXPECT_EQ(gpud::vulkan::try_open_on({}), nullptr);
+}
+
+// The app-owns-the-device shape: gpud computes on a queue it was
+// handed and never destroys what it adopted.
+TEST(VulkanAdopt, SaxpyRunsOnAForeignDevice) {
+    vkraw::Raw r{};
+    if (!vkraw::bring_up(r)) {
+        vkraw::destroy(r);
+        GTEST_SKIP() << "vulkan: no adoptable device on this machine";
+    }
+    {
+        auto dev = gpud::vulkan::try_open_on(vkraw::desc_of(r));
+        ASSERT_NE(dev, nullptr);
+        EXPECT_EQ(dev->dialect(), "slang-vulkan");
+        vkraw::saxpy_roundtrip(*dev);
+    }
+    vkraw::destroy(r);
+}
+
+// The teardown half of non-owning: destroying the gpud Device leaves
+// the adopted VkDevice fully usable.
+TEST(VulkanAdopt, TeardownLeavesTheDeviceUsable) {
+    vkraw::Raw r{};
+    if (!vkraw::bring_up(r)) {
+        vkraw::destroy(r);
+        GTEST_SKIP() << "vulkan: no adoptable device on this machine";
+    }
+    {
+        auto dev = gpud::vulkan::try_open_on(vkraw::desc_of(r));
+        ASSERT_NE(dev, nullptr);
+        vkraw::saxpy_roundtrip(*dev);
+    }
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = 64;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    VkBuffer probe{};
+    EXPECT_EQ(vkCreateBuffer(r.dev, &bci, nullptr, &probe), VK_SUCCESS)
+        << "the adopted device must survive the gpud Device";
+    if (probe) vkDestroyBuffer(r.dev, probe, nullptr);
+    vkraw::destroy(r);
+}
+
+// share_families => buffers go CONCURRENT over compute + the app's
+// family; the whole pipeline must still round-trip.
+TEST(VulkanAdopt, ConcurrentSharingRoundTrips) {
+    vkraw::Raw r{};
+    if (!vkraw::bring_up(r)) {
+        vkraw::destroy(r);
+        GTEST_SKIP() << "vulkan: no adoptable device on this machine";
+    }
+    std::uint32_t n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(r.phys, &n, nullptr);
+    std::uint32_t other = ~0u;
+    for (std::uint32_t i = 0; i < n && other == ~0u; ++i)
+        if (i != r.fam) other = i;
+    if (other == ~0u) {
+        vkraw::destroy(r);
+        GTEST_SKIP() << "vulkan: single queue family — nothing to share with";
+    }
+    {
+        auto d = vkraw::desc_of(r);
+        d.share_families = &other;
+        d.share_family_count = 1;
+        auto dev = gpud::vulkan::try_open_on(d);
+        ASSERT_NE(dev, nullptr);
+        vkraw::saxpy_roundtrip(*dev);
+    }
+    vkraw::destroy(r);
+}
+
 // The compiler resolves at FIRST compile, not in try_open: a consumer
 // that only shares buffers and the timeline needs no shader toolchain.
 // GPUD_SLANGC pins a (non-)compiler, which is what lets this assert on

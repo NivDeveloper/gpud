@@ -50,6 +50,16 @@ class Device final : public ::gpud::Device {
         VmaAllocator allocator{};
         std::uint32_t max_queued{};   // Options::max_queued, clamped to >= 1
         std::string slangc;      // resolved at FIRST compile; empty until
+        bool owned = true;       // try_open created device+instance;
+                                 // try_open_on adopts and never destroys
+        // Size >= 2 means buffers are created CONCURRENT over these
+        // families (compute first, then the app's share_families).
+        std::vector<std::uint32_t> concurrent_families;
+        // Bracket every queue access when the VkQueue itself is shared
+        // with the app (one-queue drivers). Null = the queue is ours.
+        void (*queue_lock)(void *) = nullptr;
+        void (*queue_unlock)(void *) = nullptr;
+        void *queue_user = nullptr;
     };
 
     explicit Device(const State &state) : s(state) {}
@@ -116,6 +126,9 @@ class Device final : public ::gpud::Device {
 
     // Bound the queued work: at most max_queued_ tickets outstanding.
     void throttle_locked(std::unique_lock<std::mutex> &lock);
+
+    void q_lock() { if (s.queue_lock) s.queue_lock(s.queue_user); }
+    void q_unlock() { if (s.queue_unlock) s.queue_unlock(s.queue_user); }
 
     State s;
     std::mutex m_;

@@ -71,3 +71,15 @@ FetchContent_Declare(VulkanMemoryAllocator
 FetchContent_MakeAvailable(VulkanMemoryAllocator)
 target_include_directories(gpud_vulkan PRIVATE
     ${vulkanmemoryallocator_SOURCE_DIR}/include)
+
+# Tests adopt a device they bring up themselves, so they need the same
+# headers + loader shim this backend compiles against (volk's symbols
+# already live in gpud_vulkan).
+add_library(gpud_vulkan_testing INTERFACE)
+target_include_directories(gpud_vulkan_testing INTERFACE ${volk_SOURCE_DIR})
+target_compile_definitions(gpud_vulkan_testing INTERFACE VK_NO_PROTOTYPES)
+if(Vulkan_FOUND)
+  target_include_directories(gpud_vulkan_testing INTERFACE ${Vulkan_INCLUDE_DIRS})
+else()
+  target_link_libraries(gpud_vulkan_testing INTERFACE Vulkan::Headers)
+endif()

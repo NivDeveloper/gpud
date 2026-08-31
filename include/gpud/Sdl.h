@@ -2,7 +2,7 @@
 
 // SDL_GPU backend factory. Declaration only — no SDL types are DEFINED
 // here; the implementation links SDL3 PRIVATE inside src/sdl/. The two
-// forward declarations below are the ONE deliberate exception to the
+// forward declarations below are a deliberate exception (with Vulkan.h) to the
 // no-SDK-names rule: this backend exists so a renderer can share the
 // device, and a seam nobody can name is not a seam.
 

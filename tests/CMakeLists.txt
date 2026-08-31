@@ -21,7 +21,9 @@ target_link_libraries(gpud_tests PRIVATE gpud::mock gpud::auto_ GTest::gtest_mai
 # The conformance suite calls backend factories directly (gpud_auto only
 # links them PRIVATE); GPUD_HAS_* defines arrive via gpud::auto_.
 if(GPUD_BACKEND_VULKAN)
-  target_link_libraries(gpud_tests PRIVATE gpud::vulkan)
+  # gpud_vulkan_testing: the adoption tests create a raw device of
+  # their own to hand in.
+  target_link_libraries(gpud_tests PRIVATE gpud::vulkan gpud_vulkan_testing)
 endif()
 if(GPUD_BACKEND_SDL)
   # SDL3 itself too: the interop test makes one real SDL call on the
@@ -30,7 +32,11 @@ if(GPUD_BACKEND_SDL)
 endif()
 set_target_properties(gpud_tests PROPERTIES
     CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-target_compile_options(gpud_tests PRIVATE -Wall -Wextra)
+# -Wno-missing-field-initializers: the adoption tests speak raw Vulkan,
+# where `VkFoo f{VK_STRUCTURE_TYPE_...}` is the standard idiom (the
+# omitted fields zero-initialize) — same setting as the backend itself.
+target_compile_options(gpud_tests PRIVATE -Wall -Wextra
+    -Wno-missing-field-initializers)
 
 include(GoogleTest)
 gtest_discover_tests(gpud_tests)

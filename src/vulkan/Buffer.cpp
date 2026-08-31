@@ -32,7 +32,15 @@ Buffer Device::alloc(std::size_t bytes) {
     bci.size = bytes ? bytes : 4;   // Vulkan forbids zero-size buffers
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
-    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    // An adopted device may share buffers with the app's queue
+    // families (AdoptDesc::share_families): CONCURRENT forgoes the
+    // ownership-transfer barriers this library has no seam to emit.
+    // Ignored fields under EXCLUSIVE, per spec.
+    bci.sharingMode = s.concurrent_families.size() >= 2
+                          ? VK_SHARING_MODE_CONCURRENT
+                          : VK_SHARING_MODE_EXCLUSIVE;
+    bci.queueFamilyIndexCount = std::uint32_t(s.concurrent_families.size());
+    bci.pQueueFamilyIndices = s.concurrent_families.data();
 
     // MAPPED keeps the suballocation mapped for as long as it lives, so
     // the pointer below stays good and write()/read() are plain memcpys.

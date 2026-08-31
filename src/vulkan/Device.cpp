@@ -33,6 +33,78 @@ bool has_extension(const std::vector<VkExtensionProperties> &exts,
     return false;
 }
 
+// The device-level bring-up both factories share: command pool,
+// timeline semaphore, VMA. On failure it unwinds what IT created, and
+// the device/instance too only when this Device owns them.
+std::unique_ptr<::gpud::Device> open_common(Device::State &s,
+                                            const Options &opts) {
+    const auto common_fail =
+        [&](const char *why) -> std::unique_ptr<::gpud::Device> {
+        log(why);
+        if (s.timeline) vkDestroySemaphore(s.device, s.timeline, nullptr);
+        if (s.pool) vkDestroyCommandPool(s.device, s.pool, nullptr);
+        if (s.owned) {
+            vkDestroyDevice(s.device, nullptr);
+            vkDestroyInstance(s.instance, nullptr);
+        }
+        return nullptr;
+    };
+
+    // The command pool batches are recorded into (allocated lazily and
+    // recycled — see begin_batch_locked) plus the timeline semaphore
+    // every submission signals. RESET_COMMAND_BUFFER_BIT is what lets a
+    // completed buffer be re-recorded by vkBeginCommandBuffer alone.
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = s.queue_family;
+    if (vkCreateCommandPool(s.device, &pci, nullptr, &s.pool) != VK_SUCCESS)
+        return common_fail("vkCreateCommandPool failed");
+
+    VkSemaphoreTypeCreateInfo stci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    stci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    stci.initialValue = 0;   // ticket 0 = "nothing has ever been queued"
+    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    sci.pNext = &stci;
+    if (vkCreateSemaphore(s.device, &sci, nullptr, &s.timeline) != VK_SUCCESS)
+        return common_fail("vkCreateSemaphore failed");
+
+    // VMA suballocates from large blocks, which is what keeps alloc()
+    // off vkAllocateMemory/vkMapMemory. BUFFER_DEVICE_ADDRESS is
+    // load-bearing rather than stylistic: it is what makes VMA tag the
+    // backing allocation with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+    // without which a buffer created for BDA cannot be bound. Only the
+    // two getters are supplied — with dynamic functions VMA imports the
+    // rest through them.
+    VmaVulkanFunctions vf{};
+    vf.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
+    vf.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
+    VmaAllocatorCreateInfo aci{};
+    aci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    aci.physicalDevice = s.phys;
+    aci.device = s.device;
+    aci.instance = s.instance;
+
+    // Options::pool_budget_bytes, applied to every heap: the allocator
+    // stops growing there and alloc() reports the pool exhausted rather
+    // than the process quietly ballooning. Must outlive the call below.
+    std::vector<VkDeviceSize> heap_limits;
+    if (opts.pool_budget_bytes != 0) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(s.phys, &mp);
+        heap_limits.assign(mp.memoryHeapCount,
+                           VkDeviceSize(opts.pool_budget_bytes));
+        aci.pHeapSizeLimit = heap_limits.data();
+    }
+    // Matches the instance above: claiming a higher version would let VMA
+    // reach for entry points this device never loaded.
+    aci.vulkanApiVersion = VK_API_VERSION_1_2;
+    aci.pVulkanFunctions = &vf;
+    if (vmaCreateAllocator(&aci, &s.allocator) != VK_SUCCESS)
+        return common_fail("vmaCreateAllocator failed");
+
+    return std::make_unique<Device>(s);
+}
+
 } // namespace
 
 std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
@@ -158,70 +230,57 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     volkLoadDevice(s.device);
     vkGetDeviceQueue(s.device, s.queue_family, 0, &s.queue);
 
-    // The command pool batches are recorded into (allocated lazily and
-    // recycled — see begin_batch_locked) plus the timeline semaphore
-    // every submission signals. RESET_COMMAND_BUFFER_BIT is what lets a
-    // completed buffer be re-recorded by vkBeginCommandBuffer alone.
-    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-    pci.queueFamilyIndex = s.queue_family;
-    if (vkCreateCommandPool(s.device, &pci, nullptr, &s.pool) != VK_SUCCESS)
-        return fail("vkCreateCommandPool failed");
+    return open_common(s, opts);
+}
 
-    VkSemaphoreTypeCreateInfo stci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
-    stci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    stci.initialValue = 0;   // ticket 0 = "nothing has ever been queued"
-    VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    sci.pNext = &stci;
-    if (vkCreateSemaphore(s.device, &sci, nullptr, &s.timeline) != VK_SUCCESS) {
-        vkDestroyCommandPool(s.device, s.pool, nullptr);
-        return fail("vkCreateSemaphore failed");
+std::unique_ptr<::gpud::Device> try_open_on(const AdoptDesc &desc,
+                                            const Options &opts) {
+    if (!desc.instance || !desc.physical || !desc.device || !desc.queue ||
+        !desc.get_instance_proc_addr)
+        return log("try_open_on: null handle in AdoptDesc"), nullptr;
+
+    Device::State s;
+    s.owned = false;
+    s.max_queued = opts.max_queued < 1 ? 1 : opts.max_queued;
+
+    // The app's loader entry point seeds volk's process-global tables,
+    // so gpud dispatches through the same loader as the app. Process-
+    // global is the documented limit (one vulkan Device at a time).
+    volkInitializeCustom(desc.get_instance_proc_addr);
+    s.instance = desc.instance;
+    volkLoadInstance(s.instance);
+    s.phys = desc.physical;
+    s.device = desc.device;
+    volkLoadDevice(s.device);
+    s.queue = desc.queue;
+    s.queue_family = desc.queue_family;
+    s.queue_lock = desc.queue_lock;
+    s.queue_unlock = desc.queue_unlock;
+    s.queue_user = desc.queue_user;
+
+    // Compute family first, then the app's, deduplicated; fewer than
+    // two distinct families means plain EXCLUSIVE after all.
+    s.concurrent_families.push_back(desc.queue_family);
+    for (std::size_t i = 0; i < desc.share_family_count; ++i) {
+        const std::uint32_t f = desc.share_families[i];
+        bool have = false;
+        for (std::uint32_t seen : s.concurrent_families)
+            have = have || seen == f;
+        if (!have) s.concurrent_families.push_back(f);
     }
+    if (s.concurrent_families.size() < 2) s.concurrent_families.clear();
 
-    // VMA suballocates from large blocks, which is what keeps alloc()
-    // off vkAllocateMemory/vkMapMemory. BUFFER_DEVICE_ADDRESS is
-    // load-bearing rather than stylistic: it is what makes VMA tag the
-    // backing allocation with VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
-    // without which a buffer created for BDA cannot be bound. Only the
-    // two getters are supplied — with dynamic functions VMA imports the
-    // rest through them.
-    VmaVulkanFunctions vf{};
-    vf.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
-    vf.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
-    VmaAllocatorCreateInfo aci{};
-    aci.flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-    aci.physicalDevice = s.phys;
-    aci.device = s.device;
-    aci.instance = s.instance;
-
-    // Options::pool_budget_bytes, applied to every heap: the allocator
-    // stops growing there and alloc() reports the pool exhausted rather
-    // than the process quietly ballooning. Must outlive the call below.
-    std::vector<VkDeviceSize> heap_limits;
-    if (opts.pool_budget_bytes != 0) {
-        VkPhysicalDeviceMemoryProperties mp;
-        vkGetPhysicalDeviceMemoryProperties(s.phys, &mp);
-        heap_limits.assign(mp.memoryHeapCount,
-                           VkDeviceSize(opts.pool_budget_bytes));
-        aci.pHeapSizeLimit = heap_limits.data();
-    }
-    // Matches the instance above: claiming a higher version would let VMA
-    // reach for entry points this device never loaded.
-    aci.vulkanApiVersion = VK_API_VERSION_1_2;
-    aci.pVulkanFunctions = &vf;
-    if (vmaCreateAllocator(&aci, &s.allocator) != VK_SUCCESS) {
-        vkDestroySemaphore(s.device, s.timeline, nullptr);
-        vkDestroyCommandPool(s.device, s.pool, nullptr);
-        return fail("vmaCreateAllocator failed");
-    }
-
-    return std::make_unique<Device>(s);
+    return open_common(s, opts);
 }
 
 Device::~Device() {
     // Nothing else may touch a dying Device (handles don't outlive it,
     // and the thread-safe corner is for live devices), so no lock here.
-    vkDeviceWaitIdle(s.device);
+    // Idle OUR queue, not the device: on an adopted device a
+    // vkDeviceWaitIdle would stall the app's other queues too.
+    q_lock();
+    vkQueueWaitIdle(s.queue);
+    q_unlock();
     // Unconditional: the device is idle, so every deferred release is
     // safe to run regardless of what its ticket says. A ticket-checked
     // reclaim would strand entries sitting behind a ticket the timeline
@@ -235,8 +294,10 @@ Device::~Device() {
     vkDestroySemaphore(s.device, s.timeline, nullptr);
     // Frees every command buffer allocated from it, batch_ included.
     vkDestroyCommandPool(s.device, s.pool, nullptr);
-    vkDestroyDevice(s.device, nullptr);
-    vkDestroyInstance(s.instance, nullptr);
+    if (s.owned) {
+        vkDestroyDevice(s.device, nullptr);
+        vkDestroyInstance(s.instance, nullptr);
+    }
 }
 
 Ticket Device::completed() const {
@@ -382,7 +443,9 @@ void Device::submit_batch_locked() {
         si.pCommandBuffers = &batch_;
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s.timeline;
+        q_lock();
         r = vkQueueSubmit(s.queue, 1, &si, VK_NULL_HANDLE);
+        q_unlock();
     }
 
     pending_.push_back({ticket, batch_});
