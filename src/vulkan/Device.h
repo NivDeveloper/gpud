@@ -130,6 +130,8 @@ class Device final : public ::gpud::Device {
     void q_lock() { if (s.queue_lock) s.queue_lock(s.queue_user); }
     void q_unlock() { if (s.queue_unlock) s.queue_unlock(s.queue_user); }
 
+    friend std::uint64_t native_timeline(::gpud::Device &);
+
     State s;
     std::mutex m_;
 

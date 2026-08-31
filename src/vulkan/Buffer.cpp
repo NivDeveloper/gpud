@@ -8,6 +8,15 @@
 
 namespace gpud::vulkan {
 
+std::uint64_t native_buffer(::gpud::Buffer &b) {
+    // dynamic_cast rejects a foreign backend's Buffer (and an empty
+    // handle) with 0 rather than a misread pointer. Offset is always 0:
+    // each Buffer owns a whole VkBuffer, VMA binds beneath it.
+    auto *impl = dynamic_cast<BufferImpl *>(b.impl());
+    return impl ? reinterpret_cast<std::uintptr_t>(impl->buffer) : 0;
+}
+
+
 BufferImpl::~BufferImpl() {
     // The handle dies here, but the memory must not while queued work
     // can still reference it — hand it to the Device, which releases it

@@ -273,6 +273,15 @@ std::unique_ptr<::gpud::Device> try_open_on(const AdoptDesc &desc,
     return open_common(s, opts);
 }
 
+std::uint64_t native_timeline(::gpud::Device &dev) {
+    // The device timeline itself: its signaled value IS Ticket::value
+    // (submit_batch_locked signals the batch's last ticket), which with
+    // submit() is what lets a renderer wait GPU-side on compute. A
+    // foreign backend's Device yields 0.
+    auto *impl = dynamic_cast<Device *>(&dev);
+    return impl ? reinterpret_cast<std::uintptr_t>(impl->s.timeline) : 0;
+}
+
 Device::~Device() {
     // Nothing else may touch a dying Device (handles don't outlive it,
     // and the thread-safe corner is for live devices), so no lock here.

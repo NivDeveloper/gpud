@@ -730,6 +730,54 @@ void saxpy_roundtrip(gpud::Device &dev) {
 
 } // namespace vkraw
 
+// The export seam: the timeline whose signaled value is Ticket::value
+// verbatim, and per-buffer VkBuffers — 0 for empty or foreign handles.
+// Adoption supplies the VkDevice the counter query needs.
+TEST(VulkanInterop, NativeHandlesAreLiveAndTicketsAreSemaphoreValues) {
+    vkraw::Raw r{};
+    if (!vkraw::bring_up(r)) {
+        vkraw::destroy(r);
+        GTEST_SKIP() << "vulkan: no adoptable device on this machine";
+    }
+    {
+        auto dev = gpud::vulkan::try_open_on(vkraw::desc_of(r));
+        ASSERT_NE(dev, nullptr);
+
+        const std::uint64_t sem = gpud::vulkan::native_timeline(*dev);
+        ASSERT_NE(sem, 0u);
+
+        std::uint64_t counter = ~0ull;
+        ASSERT_EQ(vkGetSemaphoreCounterValue(
+                      r.dev, reinterpret_cast<VkSemaphore>(sem), &counter),
+                  VK_SUCCESS);
+        EXPECT_EQ(counter, dev->completed().value) << "identity before work";
+
+        vkraw::saxpy_roundtrip(*dev);   // read() inside forces completion
+        ASSERT_EQ(vkGetSemaphoreCounterValue(
+                      r.dev, reinterpret_cast<VkSemaphore>(sem), &counter),
+                  VK_SUCCESS);
+        EXPECT_EQ(counter, dev->completed().value) << "identity after work";
+        EXPECT_EQ(counter, dev->submitted().value)
+            << "the semaphore signals Ticket::value verbatim";
+        EXPECT_GE(counter, 1u);
+
+        gpud::Buffer b = dev->alloc(64);
+        const std::uint64_t nb1 = gpud::vulkan::native_buffer(b);
+        EXPECT_NE(nb1, 0u);
+        EXPECT_EQ(nb1, gpud::vulkan::native_buffer(b))
+            << "the handle must be stable across calls";
+
+        gpud::Buffer empty;
+        EXPECT_EQ(gpud::vulkan::native_buffer(empty), 0u);
+
+        auto foreign = gpud::mock::try_open();
+        EXPECT_EQ(gpud::vulkan::native_timeline(*foreign), 0u);
+        gpud::Buffer fb = foreign->alloc(16);
+        EXPECT_EQ(gpud::vulkan::native_buffer(fb), 0u);
+    }
+    vkraw::destroy(r);
+}
+
 TEST(VulkanAdopt, RefusesNullHandles) {
     EXPECT_EQ(gpud::vulkan::try_open_on({}), nullptr);
 }
