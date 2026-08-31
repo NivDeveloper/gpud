@@ -281,6 +281,15 @@ void Device::wait_locked(std::unique_lock<std::mutex> &lock,
     reclaim_locked(false);
 }
 
+void Device::submit() {
+    // The open batch goes to the queue and its last ticket will be
+    // signalled — the non-blocking half of flush(), for waiters that
+    // are not this host thread. A failed vkQueueSubmit host-signals
+    // and throws here, so an external waiter can never hang.
+    std::lock_guard lock(m_);
+    submit_batch_locked();
+}
+
 void Device::defer_release(std::uint64_t ticket, std::function<void()> release) {
     std::lock_guard lock(m_);
     if (ticket <= completed_cache_ || ticket <= completed().value) {

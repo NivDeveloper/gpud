@@ -76,6 +76,7 @@ class Device final : public ::gpud::Device {
     }
     Ticket completed() const override;
     void wait(Ticket ticket) override;
+    void submit() override;
 
     // Deferred release. A Buffer handle may die while queued work still
     // reads its memory, so BufferImpl hands its teardown here instead of

@@ -30,9 +30,9 @@
 //     metadata.
 //
 //  3. External synchronization, with one carve-out. Calls on one Device
-//     must be externally synchronized — except submitted(), completed()
-//     and wait(), which are safe to call from another thread while one
-//     is inside a Device call. Observing the timeline from elsewhere is
+//     must be externally synchronized — except submitted(), completed(),
+//     wait() and submit(), which are safe to call from another thread
+//     while one is inside a Device call. Observing the timeline from elsewhere is
 //     the entire point of exposing it, so it would be useless otherwise.
 //     Distinct Devices are independent.
 //
@@ -225,6 +225,14 @@ class Device {
     virtual Ticket submitted() const { return {}; }   // last enqueued
     virtual Ticket completed() const { return {}; }   // highest done
     virtual void wait(Ticket /*ticket*/) {}
+
+    // Non-blocking: after it returns, everything enqueued so far will
+    // reach completed() with no further host call — which is what an
+    // EXTERNAL waiter (a renderer waiting GPU-side on this timeline)
+    // needs from a backend that batches until the host observes.
+    // Eagerly-submitting backends are already there, so the default
+    // no-op is honest. Part of the thread-safe carve-out (note 3).
+    virtual void submit() {}
 
     // Block until everything enqueued so far has completed. Non-virtual:
     // it is exactly wait(submitted()), and a backend that got those two

@@ -37,6 +37,7 @@ inline void PrintTo(const Ticket &t, std::ostream *os) {
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -540,6 +541,36 @@ TEST_P(Conformance, RecycleWhileQueued) {
             ASSERT_EQ(out[i], 2.0f * seed_of(round, i))
                 << "round " << round << " index " << i;
     }
+}
+
+// submit() is the non-blocking half of flush(): after it, the work
+// must reach completed() with NO further host call — the property an
+// external GPU-side waiter depends on. completed() polls and never
+// submits, so for a batching backend this loop terminates only if
+// submit() really pushed the batch.
+TEST_P(Conformance, SubmitMakesProgressWithoutHostWaits) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    gpud::Device &dev = *dev_;
+
+    constexpr std::uint32_t N = 256;
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &b};
+
+    const gpud::Ticket t = dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    dev.submit();
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (dev.completed() < t) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "submit() did not make the work reach completed()";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_GE(dev.completed(), t);
 }
 
 TEST_P(Conformance, BadKernelThrowsWithDiagnostics) {
