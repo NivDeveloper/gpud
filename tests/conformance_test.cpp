@@ -572,3 +572,42 @@ TEST(SdlInterop, NativeHandlesAreLive) {
 }
 
 #endif
+
+#ifdef GPUD_HAS_VULKAN
+
+// The compiler resolves at FIRST compile, not in try_open: a consumer
+// that only shares buffers and the timeline needs no shader toolchain.
+// GPUD_SLANGC pins a (non-)compiler, which is what lets this assert on
+// a machine where slangc is installed.
+TEST(VulkanLazySlangc, OpensWithoutCompilerAndCompileThrowsByName) {
+    auto plain = gpud::vulkan::try_open();
+    if (!plain)
+        GTEST_SKIP() << "vulkan: try_open returned nullptr on this machine";
+    plain.reset();
+
+#ifdef _WIN32
+    _putenv_s("GPUD_SLANGC", "gpud-no-such-compiler");
+#else
+    setenv("GPUD_SLANGC", "/gpud-no-such-compiler", 1);
+#endif
+    auto dev = gpud::vulkan::try_open();
+    ASSERT_NE(dev, nullptr) << "try_open must not need the compiler";
+
+    gpud::Buffer b = dev->alloc(64);
+    const float v[4] = {1, 2, 3, 4};
+    dev->write(b, v, sizeof v);   // storage works without a compiler
+
+    try {
+        (void)dev->compile("void main() {}");
+        FAIL() << "compile without a compiler must throw";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("slangc"), std::string::npos);
+    }
+#ifdef _WIN32
+    _putenv_s("GPUD_SLANGC", "");
+#else
+    unsetenv("GPUD_SLANGC");
+#endif
+}
+
+#endif

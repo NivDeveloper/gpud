@@ -26,21 +26,6 @@ void log(const char *msg) {
     if (on) std::fprintf(stderr, "gpud/vulkan: try_open: %s\n", msg);
 }
 
-// std::system's shell may not have /usr/local/bin or /opt/homebrew/bin
-// on PATH — probe the common install locations (vklib-proven).
-std::string find_slangc() {
-    for (const char *c :
-         {"/usr/local/bin/slangc", "/opt/homebrew/bin/slangc", "slangc"}) {
-#ifdef _WIN32
-        const std::string probe = std::string(c) + " -h > NUL 2>&1";
-#else
-        const std::string probe = std::string(c) + " -h > /dev/null 2>&1";
-#endif
-        if (std::system(probe.c_str()) == 0) return c;
-    }
-    return {};
-}
-
 bool has_extension(const std::vector<VkExtensionProperties> &exts,
                    const char *name) {
     for (const auto &e : exts)
@@ -54,8 +39,6 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
     Device::State s;
 
     s.max_queued = opts.max_queued < 1 ? 1 : opts.max_queued;
-    s.slangc = find_slangc();
-    if (s.slangc.empty()) return log("no slangc"), nullptr;
 
     if (volkInitialize() != VK_SUCCESS)
         return log("no Vulkan loader"), nullptr;

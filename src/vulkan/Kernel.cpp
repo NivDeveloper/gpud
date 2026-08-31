@@ -20,6 +20,35 @@
 namespace gpud::vulkan {
 namespace {
 
+// std::system's shell may not have /usr/local/bin or /opt/homebrew/bin
+// on PATH — probe the common install locations (vklib-proven). Resolved
+// HERE, at first compile, not in try_open: a consumer that only shares
+// buffers and the timeline never needs a shader toolchain (the sdl
+// backend made the same move).
+std::string find_slangc() {
+    // GPUD_SLANGC pins the compiler outright — and pins its absence,
+    // which is what makes the lazy resolution testable on a machine
+    // that has slangc installed.
+    if (const char *pin = std::getenv("GPUD_SLANGC")) {
+#ifdef _WIN32
+        const std::string probe = std::string(pin) + " -h > NUL 2>&1";
+#else
+        const std::string probe = std::string(pin) + " -h > /dev/null 2>&1";
+#endif
+        return std::system(probe.c_str()) == 0 ? pin : "";
+    }
+    for (const char *c :
+         {"/usr/local/bin/slangc", "/opt/homebrew/bin/slangc", "slangc"}) {
+#ifdef _WIN32
+        const std::string probe = std::string(c) + " -h > NUL 2>&1";
+#else
+        const std::string probe = std::string(c) + " -h > /dev/null 2>&1";
+#endif
+        if (std::system(probe.c_str()) == 0) return c;
+    }
+    return {};
+}
+
 std::string slurp(const std::filesystem::path &p) {
     std::ifstream in(p, std::ios::binary);
     return {std::istreambuf_iterator<char>(in), {}};
@@ -60,6 +89,16 @@ std::string compile_slang(const std::string &slangc, std::string_view source) {
 } // namespace
 
 Kernel Device::do_compile(std::string_view source) {
+    // do_compile is externally synchronized (only the timeline trio is
+    // thread-safe), so caching the resolved path needs no lock.
+    if (s.slangc.empty()) {
+        s.slangc = find_slangc();
+        if (s.slangc.empty())
+            throw std::runtime_error(
+                "gpud/vulkan: compile: no slangc at /usr/local/bin, "
+                "/opt/homebrew/bin or on PATH — kernels need the Slang "
+                "compiler; buffers and the timeline do not");
+    }
     const std::string spirv = compile_slang(s.slangc, source);
 
     auto impl = std::make_unique<KernelImpl>();

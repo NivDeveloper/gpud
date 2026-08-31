@@ -49,7 +49,7 @@ class Device final : public ::gpud::Device {
                                  // the ticket of its last dispatch
         VmaAllocator allocator{};
         std::uint32_t max_queued{};   // Options::max_queued, clamped to >= 1
-        std::string slangc;      // resolved compiler path
+        std::string slangc;      // resolved at FIRST compile; empty until
     };
 
     explicit Device(const State &state) : s(state) {}
