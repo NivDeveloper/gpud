@@ -411,6 +411,30 @@ Sequencing and contract notes, borne out in the build:
   above), which needs no GPU sync at all for a producer that parks a
   fresh buffer per step.
 
+### Eager submission and the pool (0.8)
+
+The batching design as shipped in 0.2 submitted a batch only when the
+host observed the timeline or the bound tripped — right when the host
+was the only consumer, wrong the moment a renderer or a free-running
+producer was: the device ran a 64-dispatch batch, then idled while the
+host recorded the next 64. examples/ising measured 5.9k sweeps/s with
+500 ms buckets swinging 3.7k–13k; with `Options::batch = 16` and the
+batch submitted the moment it is full, 24k, ±1% after the first bucket
+(which is kernel compilation, not the queue). `max_queued` keeps its
+one job — the bound — and wants to be at least twice the batch.
+
+Eager submission exposed a latent use-after-free: MoltenVK makes every
+live device-address buffer resident in each batch it encodes, so a
+buffer freed as soon as its own last dispatch completed was still
+referenced by later batches — Metal's validation names it ("object
+destroyed while still required by the command buffer") and the device
+is lost at any depth past 64. Dead buffers therefore go to a pool and
+come back on the next same-sized alloc(); nothing is destroyed under
+load, which is also why a free-running producer now creates nothing.
+The cost that remains is Metal's residency walk, proportional to the
+number of live buffers — 87% of encode time sampled — which puts the
+next lever above this library: fewer, reused buffers per step.
+
 ### What the build added to the note
 
 - **The trio is virtual with defaults, not pure.** `submitted()` and

@@ -16,7 +16,11 @@ share_families; optional queue-lock brackets for one-queue drivers;
 teardown idles only its queue and never destroys what it adopted),
 and native_buffer/native_timeline export VkBuffer and the timeline
 semaphore, whose signaled value IS Ticket::value — that identity is
-API. SDL_GPU: slot-bound ABI ("slang-slot"),
+API. v0.8 makes submission eager (Options::batch, default 16 — 4x on
+a free-running producer) and RECYCLES dead buffers through a pool
+instead of freeing them (a driver may keep every live buffer resident
+per encoded batch, so a free under load loses the device; MoltenVK
+past depth 64). SDL_GPU: slot-bound ABI ("slang-slot"),
 slangc → SPIR-V resolved lazily at first compile (bring-up needs no
 toolchain), async run() on a fence ring behind the ticket timeline, native
 SDL_GPUDevice/SDL_GPUBuffer handle export for renderer sharing;
@@ -51,7 +55,10 @@ cuda/metal remain scaffolding stubs (try_open returns nullptr).
   rejected: no Signal/Fence objects, no wait/signal lists on run().
   submit() is the non-blocking half of flush() — a timeline pump for
   external GPU-side waiters, not a sync object — and joins the
-  carve-out.
+  carve-out. Submission is EAGER (0.8): a batch of Options::batch
+  dispatches goes out when full, a shorter one waits for an observer
+  or submit(); max_queued is only the bound and wants to be at least
+  twice the batch.
 - **Fresh allocations are unspecified.** alloc() may hand back memory a
   destroyed Buffer owned, so its contents are undefined — write before
   reading. Conversely a Buffer may be destroyed while work using it is

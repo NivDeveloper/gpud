@@ -18,15 +18,17 @@ class Device;   // ~BufferImpl defers its teardown to the owning Device
 // Host-visible, host-coherent, persistently mapped storage buffer with
 // a device address (the BDA push-constant ABI). Simple and — on unified
 // memory (Apple Silicon, iGPUs) — fast; staging is a post-v1 concern.
-// The allocation is a suballocation of one of VMA's blocks, so it may
-// well be memory a destroyed Buffer used to hold.
+// The device objects OUTLIVE the handle: a dead Buffer's VkBuffer goes
+// back to the Device's pool and the next same-sized alloc() gets it —
+// which is why a fresh buffer's contents are unspecified, and why a
+// free-running producer never creates or destroys anything.
 struct BufferImpl final : ::gpud::Buffer::Impl {
     Device *owner{};          // non-owning; the Device that allocated this
-    VmaAllocator allocator{};   // non-owning, for destruction
     VkBuffer buffer{};
     VmaAllocation allocation{};
     void *mapped{};
     VkDeviceAddress address{};
+    std::size_t size = 0;     // the VkBuffer's size: the pool's key
 
     // Ticket of the most recent run() that referenced this buffer; 0 =
     // never used by a dispatch. This is the "has the work touching this

@@ -81,6 +81,33 @@ void main(uint3 tid : SV_DispatchThreadID) {
 )";
 #endif
 
+#ifdef GPUD_HAS_VULKAN
+// The same saxpy with a deliberately expensive inner loop, so a
+// dispatch takes long enough for batches to queue up behind it.
+constexpr char vulkan_saxpy_heavy[] = R"(
+struct Buf_float { float data[1]; };
+struct PC {
+  float s0;
+  uint s1;
+  Buf_float* out_buf;
+  Buf_float* in0;
+  Buf_float* in1;
+};
+[[vk::push_constant]] PC pc;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+  uint i = tid.x;
+  if (i >= pc.s1) return;
+  float acc = pc.in0.data[i];
+  for (uint k = 0; k < 512; ++k)
+    acc = sin(acc) + pc.s0 * cos(pc.in1.data[i] + float(k));
+  pc.out_buf.data[i] = acc;
+}
+)";
+#endif
+
 #ifdef GPUD_HAS_SDL
 // Mirrors the shape consumers' code generators emit for "slang-slot":
 // numbered [[vk::binding]] resources, scalars behind a ConstantBuffer.
@@ -573,6 +600,38 @@ TEST_P(Conformance, SubmitMakesProgressWithoutHostWaits) {
     EXPECT_GE(dev.completed(), t);
 }
 
+// Submission is eager: a batch of Options::batch dispatches reaches
+// the device with NO host call at all — not a wait, not a read, not a
+// submit(). completed() polls and never submits, so this loop ends
+// only if run() itself pushed the batch out.
+TEST_P(Conformance, FullBatchReachesCompletionWithoutHostCalls) {
+    if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
+    constexpr std::uint32_t kBatch = 4;
+    auto dev_ptr = GetParam().open_with(gpud::Options{.batch = kBatch});
+    if (!dev_ptr) GTEST_SKIP() << "open_with returned nullptr";
+    gpud::Device &dev = *dev_ptr;
+
+    constexpr std::uint32_t N = 256;
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(GetParam().saxpy);
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &b};
+
+    gpud::Ticket last;
+    for (std::uint32_t i = 0; i < kBatch; ++i)
+        last = dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (dev.completed() < last) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "a full batch must reach the device without a host call";
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 TEST_P(Conformance, BadKernelThrowsWithDiagnostics) {
     if (!GetParam().saxpy) GTEST_SKIP() << "storage-only backend";
     static constexpr char garbage[] = "this is not a kernel {";
@@ -729,6 +788,111 @@ void saxpy_roundtrip(gpud::Device &dev) {
 }
 
 } // namespace vkraw
+
+// The pool: a dead buffer's device objects come back on the next
+// same-sized alloc() — the same VkBuffer — once its last reader has
+// completed; while a dispatch still reads it, alloc() gets a different
+// one. A producer allocating per step therefore creates nothing.
+TEST(VulkanPool, RecyclesOnceTheLastReaderCompleted) {
+    auto dev_ptr = gpud::vulkan::try_open();
+    if (!dev_ptr) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+    gpud::Device &dev = *dev_ptr;
+
+    constexpr std::uint32_t N = 1 << 16;
+    const gpud::Kernel &heavy = dev.compile(vulkan_saxpy_heavy);
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+
+    std::uint64_t first = 0;
+    {
+        gpud::Buffer a = dev.alloc(N * sizeof(float));
+        first = gpud::vulkan::native_buffer(a);
+        gpud::Buffer *buffers[] = {&o, &a, &b};
+        dev.run(heavy, (N + 63) / 64, blob_of(sc), buffers);
+        dev.submit();
+    }   // a dies with its dispatch in flight
+    gpud::Buffer busy = dev.alloc(N * sizeof(float));
+    EXPECT_NE(gpud::vulkan::native_buffer(busy), first)
+        << "a buffer a queued dispatch still reads must not be reused";
+    dev.flush();
+    gpud::Buffer other = dev.alloc(2 * N * sizeof(float));
+    EXPECT_NE(gpud::vulkan::native_buffer(other), first) << "sizes differ";
+    gpud::Buffer again = dev.alloc(N * sizeof(float));
+    EXPECT_EQ(gpud::vulkan::native_buffer(again), first)
+        << "the same-sized buffer comes back once its reader completed";
+}
+
+// The other half of eager submission, pinned so nobody "fixes" it: a
+// batch SHORTER than Options::batch stays open — completed() does not
+// reach it on its own — until submit() pushes it out. A backend that
+// submits per dispatch (sdl's fence ring) has no open batch and no such
+// promise, so this is the batching backend's alone.
+TEST(VulkanBatching, ShortBatchStaysOpenUntilSubmit) {
+    auto dev_ptr = gpud::vulkan::try_open(gpud::Options{.batch = 8});
+    if (!dev_ptr) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+    gpud::Device &dev = *dev_ptr;
+
+    constexpr std::uint32_t N = 256;
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    const gpud::Kernel &k = dev.compile(vulkan_saxpy);
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &b};
+
+    gpud::Ticket last;
+    for (int i = 0; i < 7; ++i)   // one short of the batch
+        last = dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_LT(dev.completed(), last) << "a short batch must not go out by itself";
+
+    dev.submit();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (dev.completed() < last) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    dev.flush();
+}
+
+// A free-running producer's shape: fresh buffers for every dispatch,
+// dropped as soon as the dispatch is recorded, at a depth that keeps
+// many batches in flight. What it caught: MoltenVK makes EVERY live
+// device-address buffer resident in a batch at encode time, so a
+// buffer freed the moment its own last dispatch completed was still
+// referenced by later batches — "Invalid Resource", the device lost.
+// The release is two-phase now (the VkBuffer at last_use, its memory
+// once everything submitted by then has completed), and this is the
+// test that turns red without it.
+TEST(VulkanBatching, FreshBuffersPerDispatchAtDepthSurvive) {
+    auto dev_ptr = gpud::vulkan::try_open(
+        gpud::Options{.max_queued = 256, .batch = 16});
+    if (!dev_ptr) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+    gpud::Device &dev = *dev_ptr;
+
+    // Heavy enough that batches queue up unscheduled, and a CHAIN: each
+    // dispatch reads the previous output, which then dies — the Sync's
+    // slot rotation, in miniature.
+    constexpr std::uint32_t N = 1 << 16;
+    const gpud::Kernel &k = dev.compile(vulkan_saxpy_heavy);
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer prev = dev.alloc(N * sizeof(float));
+    try {
+        for (int i = 0; i < 3000; ++i) {
+            gpud::Buffer out = dev.alloc(N * sizeof(float));
+            gpud::Buffer b = dev.alloc(N * sizeof(float));
+            gpud::Buffer *buffers[] = {&out, &prev, &b};
+            dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+            prev = std::move(out);   // the old prev dies here
+        }
+        dev.flush();
+    } catch (const std::runtime_error &e) {
+        FAIL() << "the device was lost: " << e.what();
+    }
+    EXPECT_EQ(dev.completed(), dev.submitted());
+}
 
 // The export seam: the timeline whose signaled value is Ticket::value
 // verbatim, and per-buffer VkBuffers — 0 for empty or foreign handles.

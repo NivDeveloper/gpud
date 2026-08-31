@@ -94,19 +94,41 @@ touching this memory completed?*
    condition variable bridging the gap. Leave the base-class defaults
    alone until then — they say "nothing is ever outstanding", which is
    exactly true of a blocking backend.
-2. **Deferred release**: a FIFO of closures keyed by ticket, drained
-   oldest-first and stopping at the first not complete. A Buffer handle
-   may die while queued work still reads its memory; its Impl's
-   destructor hands the teardown here instead of doing it inline. The
-   Device destructor drains *unconditionally* after going idle — a
-   ticket-checked drain strands everything behind a ticket that was
-   never signalled.
-3. **The platform allocator — do not write a free list.** Vulkan uses
-   VMA. CUDA gets this free from `cudaMallocAsync`/`cudaMemPool_t`:
-   stream-ordered allocation is precisely this design, built into the
-   API, so points 2 and 3 largely collapse into the driver. Metal has
-   `MTLHeap`. The allocator is per-backend and must not migrate into the
-   core.
+2. **Eager submission (0.8).** A batch is `Options::batch` dispatches
+   (default 16) and goes out the moment it is full — NOT when the
+   bound trips or the host waits, which left the device idle while the
+   host recorded the next batch: 5.9k against 24k sweeps/s on
+   examples/ising, and the 500 ms buckets swinging 3.7k–13k against
+   ±1%. `max_queued` is only the bound on how far the host runs ahead;
+   keep it at least twice the batch or the throttle serializes the two
+   (16/16 measured 5k). A batch SHORTER than `batch` stays open until
+   something observes the timeline or `submit()` — the promise an
+   external GPU-side waiter relies on; `submit()` is its non-blocking
+   pump.
+3. **Recycle, do not free (0.8).** A dead Buffer's device objects go
+   to a pool keyed by size, tagged with the last dispatch that read
+   them, and the next same-sized alloc() gets them back once that has
+   completed. Why not a free: a driver may capture EVERY live buffer's
+   residency when it encodes a batch (Metal does, for device-address
+   buffers), so a batch encoded while a buffer existed references its
+   memory long after the buffer's own last dispatch — destroying it
+   then loses the device ("object destroyed while still required by
+   the command buffer", MoltenVK at any depth past 64). A buffer never
+   destroyed under load has no such moment, and a producer allocating
+   per step creates nothing. The pool is trimmed only past twice the
+   live bytes plus 64 MB, and then in TWO phases: the VkBuffer once its
+   last reader completed, the memory once everything submitted at that
+   moment has completed. Teardown drops it after the queue is idle.
+   Metal's per-dispatch cost is proportional to the number of live
+   device-address buffers (its residency walk is 87% of encode time
+   sampled), so the pool's population — the live high-water mark — is
+   the cost to watch; fewer, reused buffers on the producer's side is
+   the lever above this layer.
+4. **The platform allocator — do not write a free list.** Vulkan uses
+   VMA beneath the pool. CUDA gets this free from
+   `cudaMallocAsync`/`cudaMemPool_t`: stream-ordered allocation is
+   precisely this design, built into the API. Metal has `MTLHeap`. The
+   allocator is per-backend and must not migrate into the core.
 
 Two things that bit the Vulkan implementation and will bite the next
 one. **Order of operations inside run():** claim the ticket only after

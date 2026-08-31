@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 namespace gpud::vulkan {
@@ -38,6 +39,8 @@ bool has_extension(const std::vector<VkExtensionProperties> &exts,
 // the device/instance too only when this Device owns them.
 std::unique_ptr<::gpud::Device> open_common(Device::State &s,
                                             const Options &opts) {
+    s.batch = opts.batch < 1 ? 1 : opts.batch;
+    if (s.batch > s.max_queued) s.batch = s.max_queued;
     const auto common_fail =
         [&](const char *why) -> std::unique_ptr<::gpud::Device> {
         log(why);
@@ -295,10 +298,11 @@ Device::~Device() {
     // reclaim would strand entries sitting behind a ticket the timeline
     // never reached — an open batch that was never submitted has some.
     reclaim_locked(true);
+    drop_idle();       // the pool, now that the queue is idle
     clear_kernels();   // KernelImpls hold pipelines — before the VkDevice
-    // After the drain, whose release closures call vmaDestroyBuffer.
+    // After the drain and the pool, whose releases call vmaDestroyBuffer.
     // (It asserts if any allocation is still live, which is a free check
-    // that the drain above really emptied out.)
+    // that the two really emptied out.)
     vmaDestroyAllocator(s.allocator);
     vkDestroySemaphore(s.device, s.timeline, nullptr);
     // Frees every command buffer allocated from it, batch_ included.
@@ -360,13 +364,39 @@ void Device::submit() {
     submit_batch_locked();
 }
 
-void Device::defer_release(std::uint64_t ticket, std::function<void()> release) {
+void Device::defer_release(std::uint64_t ticket, std::function<void()> release,
+                           std::function<void()> then) {
     std::lock_guard lock(m_);
-    if (ticket <= completed_cache_ || ticket <= completed().value) {
-        release();
-        return;
-    }
-    deferred_.push_back({ticket, std::move(release)});
+    defer_locked({ticket, std::move(release), std::move(then)});
+}
+
+void Device::defer_locked(Deferred d) {
+    // Reads only the cached completion: this can run from a destructor,
+    // and a driver poll that can throw (a lost device) must not. A stale
+    // cache only defers to the next reclaim.
+    if (d.ticket <= completed_cache_)
+        run_deferred_locked(d, false);
+    else
+        push_deferred_locked(std::move(d));
+}
+
+void Device::run_deferred_locked(Deferred &d, bool force) {
+    d.release();
+    if (!d.then) return;
+    if (force || last_submitted_ <= completed_cache_)
+        d.then();
+    else
+        push_deferred_locked({last_submitted_, std::move(d.then), {}});
+}
+
+void Device::push_deferred_locked(Deferred d) {
+    // Kept in ticket order so reclaim's front-stop stays exact: a
+    // follow-up's ticket (last_submitted_) can be below an entry whose
+    // last_use sits in the still-open batch.
+    auto pos = deferred_.end();
+    while (pos != deferred_.begin() && std::prev(pos)->ticket > d.ticket)
+        --pos;
+    deferred_.insert(pos, std::move(d));
 }
 
 void Device::reclaim() {
@@ -385,8 +415,9 @@ void Device::reclaim_locked(bool force) {
     // re-entered defer_release() — destroying a Buffer, say — would
     // deadlock on m_, which is deliberately not recursive.
     while (!deferred_.empty() && (force || deferred_.front().ticket <= done)) {
-        deferred_.front().release();
+        Deferred d = std::move(deferred_.front());
         deferred_.pop_front();
+        run_deferred_locked(d, force);
     }
     while (!pending_.empty() && (force || pending_.front().ticket <= done)) {
         free_.push_back(pending_.front().cmd);
@@ -459,6 +490,7 @@ void Device::submit_batch_locked() {
 
     pending_.push_back({ticket, batch_});
     batch_ = VK_NULL_HANDLE;
+    batch_count_ = 0;
     last_submitted_ = ticket;
 
     if (r != VK_SUCCESS) {
@@ -502,10 +534,11 @@ Ticket Device::run(const Kernel &kernel, std::size_t groups,
     for (std::size_t i = 0; i < buffers.size(); ++i)
         std::memcpy(push + addr_off + 8 * i, &impl_of(*buffers[i]).address, 8);
 
-    // Record only — no submit, no wait. Work accumulates in the open
-    // batch until something has to observe it: read(), a write() into a
-    // buffer with queued work, an explicit wait()/flush(), the throttle
-    // below, or teardown.
+    // Record, and submit only when the batch is FULL (Options::batch):
+    // eager enough that the device never drains while the host records,
+    // batched enough to amortize the submit. A shorter batch waits for
+    // whoever observes the timeline — read(), write() into a buffer with
+    // queued work, wait()/flush(), submit(), the throttle below, teardown.
     std::unique_lock lock(m_);
     reclaim_locked(false);
     throttle_locked(lock);
@@ -539,6 +572,8 @@ Ticket Device::run(const Kernel &kernel, std::size_t groups,
     const std::uint64_t ticket = submitted_.load(std::memory_order_relaxed) + 1;
     submitted_.store(ticket, std::memory_order_release);
     for (Buffer *b : buffers) impl_of(*b).last_use = ticket;
+
+    if (++batch_count_ >= s.batch) submit_batch_locked();
     return {ticket};
 }
 

@@ -22,6 +22,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gpud::vulkan {
@@ -49,6 +50,7 @@ class Device final : public ::gpud::Device {
                                  // the ticket of its last dispatch
         VmaAllocator allocator{};
         std::uint32_t max_queued{};   // Options::max_queued, clamped to >= 1
+        std::uint32_t batch{};        // Options::batch, clamped to [1, max_queued]
         std::string slangc;      // resolved at FIRST compile; empty until
         bool owned = true;       // try_open created device+instance;
                                  // try_open_on adopts and never destroys
@@ -88,11 +90,26 @@ class Device final : public ::gpud::Device {
     void wait(Ticket ticket) override;
     void submit() override;
 
-    // Deferred release. A Buffer handle may die while queued work still
-    // reads its memory, so BufferImpl hands its teardown here instead of
-    // doing it inline: `release` runs once `ticket` has completed, or
-    // right now if it already has.
-    void defer_release(std::uint64_t ticket, std::function<void()> release);
+    // The pool: a dead Buffer's device objects, waiting to be handed out
+    // again by alloc() once their last reader has completed. Nothing is
+    // destroyed under load — Buffer.cpp says why.
+    struct Idle {
+        VkBuffer buffer;
+        VmaAllocation allocation;
+        void *mapped;
+        VkDeviceAddress address;
+        std::size_t size;
+        std::uint64_t last_use;
+    };
+    void recycle(Idle);   // from ~BufferImpl
+
+    // Deferred release, in two phases — how the pool is TRIMMED: `release`
+    // (the VkBuffer) runs once `ticket` has completed; `then` (the memory)
+    // once everything submitted at that moment has completed, because a
+    // batch encoded while the buffer existed may hold its memory resident
+    // until it finishes. Either runs right away when its ticket has.
+    void defer_release(std::uint64_t ticket, std::function<void()> release,
+                       std::function<void()> then = {});
 
   protected:
     // Kernel.cpp
@@ -144,6 +161,7 @@ class Device final : public ::gpud::Device {
                                          // the common path off the driver
 
     VkCommandBuffer batch_{};            // open for recording, or null
+    std::uint32_t batch_count_ = 0;      // dispatches recorded into batch_
     std::vector<VkCommandBuffer> free_;  // recorded, completed, reusable
     struct InFlight {
         std::uint64_t ticket;
@@ -154,8 +172,23 @@ class Device final : public ::gpud::Device {
     struct Deferred {
         std::uint64_t ticket;
         std::function<void()> release;
+        std::function<void()> then;   // re-deferred to last_submitted_
     };
-    std::deque<Deferred> deferred_;
+    std::deque<Deferred> deferred_;   // ordered by ticket
+
+    // Run a due entry: its release, then its follow-up — now if nothing
+    // submitted is outstanding, else queued behind the last submission.
+    void run_deferred_locked(Deferred &d, bool force);
+    void push_deferred_locked(Deferred d);
+    void defer_locked(Deferred d);   // run now if due, else push
+
+    // Buffer.cpp — the pool
+    std::unordered_map<std::size_t, std::vector<Idle>> pool_;
+    std::size_t idle_bytes_ = 0;
+    std::size_t live_bytes_ = 0;
+    bool take_idle(std::size_t size, Idle &out);
+    void trim_locked();
+    void drop_idle();
 };
 
 } // namespace gpud::vulkan

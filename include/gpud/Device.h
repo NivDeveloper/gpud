@@ -70,14 +70,27 @@ namespace gpud {
 struct Options {
     int device_index = -1;   // -1 = let the backend pick the obvious device
 
-    // Ceiling on dispatches queued but not yet completed. Reaching it
-    // makes run() submit what it has and wait for the oldest excess
-    // ticket before recording more, which is what stops queued commands,
-    // in-flight submissions and memory awaiting release from growing
-    // without bound. Costs one stall per max_queued dispatches; raise it
-    // to let the host run further ahead, lower it to cap latency and
-    // retained memory. Values below 1 are treated as 1.
+    // Ceiling on dispatches queued but not yet completed — how far the
+    // host may run ahead of the device. Reaching it makes run() wait for
+    // the oldest excess ticket before recording more, which is what stops
+    // queued commands, in-flight submissions and memory awaiting release
+    // from growing without bound. Raise it to let the host run further
+    // ahead, lower it to cap latency and retained memory. Values below 1
+    // are treated as 1. A BOUND, not a batch: see `batch`.
     std::uint32_t max_queued = 64;
+
+    // Dispatches a backend records into one submission before handing
+    // it to the device. Submission is EAGER: the open batch goes out the
+    // moment it holds this many, so the device is fed continuously while
+    // the host records the next — a batch that went out only when the
+    // bound tripped or the host waited left the device idle in between
+    // (measured 4x on a free-running producer). Small values submit
+    // often and amortize less; large values delay the device's start.
+    // Clamped to [1, max_queued]. A backend that submits every dispatch
+    // as it comes (a fence ring) ignores it. A batch SHORTER than this
+    // stays open until something observes the timeline or submit() is
+    // called — the guarantee an external waiter relies on.
+    std::uint32_t batch = 16;
 
     // Ceiling in bytes on the device memory a backend's allocator may
     // hold; 0 = no limit. Past it an alloc() fails rather than the pool
