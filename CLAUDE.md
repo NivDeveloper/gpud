@@ -6,9 +6,17 @@ the system default compiler (AppleClang). Design rationale:
 docs/design.md; implementation plan: docs/backend-implementation.md.
 Current state: interface + header-only mock + auto-selection + TWO
 implemented backends. Vulkan: volk-loaded, BDA push-constant ABI
-("slang-vulkan"), slangc do_compile, batched submission on a timeline
-semaphore with deferred release and VMA allocation; works on MoltenVK
-with zero Apple-specific code. SDL_GPU: slot-bound ABI ("slang-slot"),
+("slang-vulkan"), slangc do_compile (resolved lazily at first compile;
+GPUD_SLANGC pins it), batched submission on a timeline semaphore with
+deferred release and VMA allocation; works on MoltenVK with zero
+Apple-specific code. v0.7 adds the renderer seam: submit() pumps the
+open batch without blocking, try_open_on ADOPTS an app-created device
+(one queue — the doctrine holds; buffers go CONCURRENT over the app's
+share_families; optional queue-lock brackets for one-queue drivers;
+teardown idles only its queue and never destroys what it adopted),
+and native_buffer/native_timeline export VkBuffer and the timeline
+semaphore, whose signaled value IS Ticket::value — that identity is
+API. SDL_GPU: slot-bound ABI ("slang-slot"),
 slangc → SPIR-V resolved lazily at first compile (bring-up needs no
 toolchain), async run() on a fence ring behind the ticket timeline, native
 SDL_GPUDevice/SDL_GPUBuffer handle export for renderer sharing;
@@ -41,14 +49,17 @@ cuda/metal remain scaffolding stubs (try_open returns nullptr).
   defaults meaning "nothing is outstanding", which is accurate for a
   blocking backend — do not make them pure. The rejected shapes stay
   rejected: no Signal/Fence objects, no wait/signal lists on run().
+  submit() is the non-blocking half of flush() — a timeline pump for
+  external GPU-side waiters, not a sync object — and joins the
+  carve-out.
 - **Fresh allocations are unspecified.** alloc() may hand back memory a
   destroyed Buffer owned, so its contents are undefined — write before
   reading. Conversely a Buffer may be destroyed while work using it is
   queued; the backend keeps the memory alive. Mock still allocates fresh
   and zero-filled: it is a test double whose log consumers assert on.
 - **External synchronization, with one carve-out.** Calls on one Device
-  are externally synchronized, except submitted()/completed()/wait(),
-  which are callable from any thread. Distinct Devices are independent.
+  are externally synchronized, except submitted()/completed()/wait()
+  and submit(), which are callable from any thread. Distinct Devices are independent.
 - **BufferSource holds nothing.** current() is the consumer's call, on
   the consumer's thread, and the pointer it returns is borrowed until
   the consumer's last use of it. A producer must not replace or destroy
@@ -82,9 +93,12 @@ include/gpud/Mock.h        header-only mock (gpud::mock::Device, try_open)
 include/gpud/Auto.h        open_default() declaration
 include/gpud/Cuda.h        cuda::try_open declaration only — never SDK types
 include/gpud/Metal.h       metal::try_open declaration only
-include/gpud/Vulkan.h      vulkan::try_open declaration only
+include/gpud/Vulkan.h      vulkan::try_open + try_open_on/AdoptDesc +
+                           native_buffer/native_timeline — the second
+                           SDK-naming carve-out (dispatchable handles
+                           forward-declared, non-dispatchable uint64)
 include/gpud/Sdl.h         sdl::try_open + native_device/native_buffer —
-                           the ONE header naming SDK types (two forward
+                           the first SDK-naming carve-out (two forward
                            declarations, no include): the renderer seam
 src/auto/open_default.cpp  env override + #ifdef GPUD_HAS_* priority chain
 src/{cuda,metal,vulkan,sdl}/  backends — the include firewall (SDK types
@@ -110,10 +124,17 @@ linked — volk (fetched, compiled in) dlopens the loader at runtime,
 headers come from find_package(Vulkan) or a fetched pinned
 Vulkan-Headers, and VMA is fetched download-only the same way volk is;
 requires driver bufferDeviceAddress (no descriptor-set fallback) and
-timelineSemaphore, both enabled explicitly; push data = scalar blob then
+timelineSemaphore, both enabled explicitly (an ADOPTED device's
+creator must have enabled the same two); push data = scalar blob then
 8-aligned buffer addresses, range fixed at 128 bytes; the
 portability-enumeration/subset handling is generic Khronos portability
 code, NOT MoltenVK-specific — keep it free of platform #ifdefs.
+Adoption (try_open_on) seeds volk's PROCESS-GLOBAL tables through the
+app's vkGetInstanceProcAddr — the documented limit stays one
+vulkan-backend Device per process (volkLoadDeviceTable is the named
+refactor if that ever pinches); a consumer recording a native_buffer
+into its own GPU work owns the other half of the lifetime bargain,
+because last_use sees only this Device's dispatches.
 
 SDL specifics worth knowing before touching src/sdl: SDL3 is found,
 never fetched (system package or CMAKE_PREFIX_PATH — this machine:
@@ -143,11 +164,13 @@ init/shutdown". Native-Metal MSL is the planned phase 2 (slang
 live there).
 
 Teardown order in ~Device is load-bearing and easy to get subtly wrong:
-waitIdle → drain deferred releases *unconditionally* (ticket-checked
-would strand entries behind a never-signalled ticket) → clear_kernels()
-(the base cache destructs after the derived dtor, and KernelImpls hold
-pipelines) → vmaDestroyAllocator (after the drain, whose closures call
-vmaDestroyBuffer) → semaphore → command pool → device → instance.
+idle OUR queue, bracketed (vkDeviceWaitIdle would stall an adopted
+device's other queues) → drain deferred releases *unconditionally*
+(ticket-checked would strand entries behind a never-signalled ticket)
+→ clear_kernels() (the base cache destructs after the derived dtor,
+and KernelImpls hold pipelines) → vmaDestroyAllocator (after the
+drain, whose closures call vmaDestroyBuffer) → semaphore → command
+pool → device → instance, the last two only when owned.
 
 Three more traps in the batching code, all commented in place: the
 throttle must use the internal wait_locked(), never the public wait(),

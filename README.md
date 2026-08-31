@@ -34,9 +34,11 @@ where SDL3's CMake package is findable (a system install, or a prefix
 on `CMAKE_PREFIX_PATH`) — found, never fetched.
 
 **Running** on the GPU needs a Vulkan ≥ 1.2 driver with
-buffer-device-address (macOS: `brew install molten-vk`) and `slangc`
-on PATH; without them `try_open()`/`open_default()` just return null
-(`GPUD_LOG=1` explains why). The SDL backend needs the same slangc
+buffer-device-address (macOS: `brew install molten-vk`); `slangc`
+resolves lazily at first kernel compile (`GPUD_SLANGC` pins it), so a
+device that only stores and shares buffers needs no compiler. Without
+a driver `try_open()`/`open_default()` just return null (`GPUD_LOG=1`
+explains why). The SDL backend needs the same slangc
 plus an SDL_GPU driver accepting SPIR-V (its Vulkan driver — try_open
 points SDL at a /usr/local or /opt/homebrew loader when the
 `SDL_VULKAN_LIBRARY` env is unset).
@@ -47,7 +49,7 @@ points SDL at a /usr/local or /opt/homebrew loader when the
 include(FetchContent)
 FetchContent_Declare(gpud
   GIT_REPOSITORY https://github.com/NivDeveloper/gpud
-  GIT_TAG v0.6.0)   # ← pin a release; bump this line to update
+  GIT_TAG v0.7.0)   # ← pin a release; bump this line to update
 FetchContent_MakeAvailable(gpud)
 
 target_link_libraries(app PRIVATE gpud::auto_)   # underscore: `auto` is a keyword

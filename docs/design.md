@@ -395,10 +395,16 @@ Sequencing and contract notes, borne out in the build:
   support host wait/poll from any thread, so the carve-out ("wait and
   completed are thread-safe; everything else stays externally
   synchronized") is cheap — but must be explicit in Device.h.
-- **Interop-grade sync** (handing a semaphore to a renderer — external
-  semaphore handles, `MTLSharedEvent` export, `cuImportExternalSemaphore`)
-  is the one case that would need an exported opaque handle. Separate,
-  later decision; nothing in the ticket model forecloses it. The
+- **Interop-grade sync** — decided and shipped in 0.7, for the
+  one-device case: `submit()` (the non-blocking half of flush(), in
+  the thread-safe carve-out) plus `vulkan::native_timeline` (the
+  timeline semaphore; its signaled value IS Ticket::value, an identity
+  the interop test pins against submitted()) let a renderer sharing
+  the VkDevice wait GPU-side on the compute that produced a buffer,
+  and `vulkan::try_open_on` is the adoption seam that makes the
+  sharing possible. CROSS-device/API export (`MTLSharedEvent`,
+  `cuImportExternalSemaphore`, external-semaphore handles) stays a
+  separate, later decision; nothing in the ticket model forecloses it. The
   HOST-side half of that question — a producer on one thread, a
   renderer on another, sharing a buffer — is answered without it: a
   role-swapping type on the consumer's side (the Threading paragraph

@@ -243,6 +243,24 @@ contract (handles-don't-outlive-device); nothing to do here.
 ~450 lines across the existing six files; bring-up (Device.cpp) is the
 bulk. No new files needed beyond what's scaffolded.
 
+### Adoption and the renderer seam (added 0.7)
+
+The app-owns-the-device shape, inverted back from 90f6028 now that a
+renderer (NVRHI over raw Vulkan) sits BESIDE gpud instead of beneath
+it: `try_open_on(AdoptDesc)` computes on the one queue it is handed.
+Non-owning teardown idles that queue only, bracketed by the optional
+queue locks (a one-queue driver hands the same VkQueue to app and
+gpud). Buffers go VK_SHARING_MODE_CONCURRENT over compute ∪
+share_families so no ownership-transfer barriers are owed. The loader
+seam is volkInitializeCustom(app's vkGetInstanceProcAddr) — process-
+global, one vulkan Device per process. Exports: native_buffer (one
+VkBuffer per Buffer, offset 0), native_timeline (signaled value ==
+Ticket::value, API), both uint64_t, dynamic_cast-refusing foreign
+handles with 0. submit() completes the story: the non-blocking pump
+that makes a GPU-side wait on the open batch impossible to hang.
+Conformance: the VulkanAdopt tests bring up a raw device of their own;
+VulkanInterop pins the ticket identity.
+
 ## SDL_GPU — IMPLEMENTED (v1, blocking)
 
 The portability-layer backend, and the renderer seam: a consumer can
