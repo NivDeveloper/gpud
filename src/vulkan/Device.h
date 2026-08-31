@@ -57,6 +57,13 @@ class Device final : public ::gpud::Device {
         std::uint32_t batch{};        // Options::batch, clamped to [1, max_queued]
         std::uint64_t wait_ns{};      // Options::wait_ms (GPUD_WAIT_MS wins);
                                       // 0 = every host wait is unbounded
+        // Options::profile (GPUD_PROFILE wins), granted only where the
+        // queue family timestamps: the pool holds a begin/end pair per
+        // batch slot, ns_per_tick is timestampPeriod.
+        bool profile = false;
+        VkQueryPool timestamps{};
+        std::uint32_t timestamp_slots = 0;
+        float ns_per_tick = 1.0f;
         std::string slangc;      // resolved at FIRST compile; empty until
         bool owned = true;       // try_open created device+instance;
                                  // try_open_on adopts and never destroys
@@ -95,6 +102,7 @@ class Device final : public ::gpud::Device {
     Ticket completed() const override;
     void wait(Ticket ticket) override;
     void submit() override;
+    std::size_t take_timings(std::span<BatchTiming> out) override;
 
     // The pool: a dead Buffer's device objects, waiting to be handed out
     // again by alloc() once their last reader has completed. Nothing is
@@ -176,8 +184,22 @@ class Device final : public ::gpud::Device {
     struct InFlight {
         std::uint64_t ticket;
         VkCommandBuffer cmd;
+        // Profiling: the batch's first ticket, its dispatch count and
+        // the timestamp slot its pair sits in (or UINT32_MAX).
+        std::uint64_t first;
+        std::uint32_t dispatches;
+        std::uint32_t slot;
     };
     std::deque<InFlight> pending_;       // submitted, awaiting completion
+    std::uint64_t batch_first_ = 0;      // first ticket of the open batch
+    std::uint32_t batch_slot_ = 0;       // its timestamp slot, when profiling
+    std::uint32_t next_slot_ = 0;        // ring over timestamp_slots
+    std::deque<BatchTiming> timings_;    // completed, awaiting take_timings
+    // Completed batches whose stamps the driver has not yet marked
+    // available (MoltenVK publishes them from the command buffer's
+    // completion handler, after the semaphore); retried each reclaim.
+    std::deque<InFlight> unread_;
+    bool collect_timing_locked(const InFlight &);
 
     struct Deferred {
         std::uint64_t ticket;

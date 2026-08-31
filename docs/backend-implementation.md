@@ -144,7 +144,18 @@ thrown from `wait()`, printed and exited from the destructor — and
 `VK_ERROR_DEVICE_LOST` its own sentence in `check()`. What the bound
 catches is not slow work but a wait on a value nothing will signal:
 the class of bug `submit()` exists to prevent, which a hang otherwise
-hides from every gate.
+hides from every gate. **Profiling (0.10):** `Options::profile`
+(`GPUD_PROFILE=1` wins) gives every batch a `vkCmdResetQueryPool` +
+begin stamp on entry, a debug label, and an end stamp before the
+submit; `reclaim_locked` reads a completed batch's pair into a bounded
+`timings_` deque that `take_timings()` drains. Two facts shaped it:
+MoltenVK marks a stamp available from the command buffer's completion
+handler, which runs after the semaphore a `wait()` returns on, so
+`VK_NOT_READY` is normal and the record is retried in order (never
+`VK_QUERY_RESULT_WAIT_BIT` — a profile must not add a wait); and the
+slot ring is `max_queued + 2` deep because pending batches are bounded
+by the throttle, with a collision against a still-unread slot dropping
+that record rather than reading a reset one.
 
 ## Vulkan (first, in full) — IMPLEMENTED as planned
 

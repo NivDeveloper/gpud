@@ -1158,6 +1158,88 @@ void teardown_past_the_bound() {
 
 } // namespace
 
+namespace {
+
+// Eight dispatches in batches of four, profiled: two timings, tickets
+// contiguous, every end after its begin, batches in order, and nothing
+// left behind once drained.
+void expect_two_batch_timings(gpud::Device &dev) {
+    constexpr std::uint32_t N = 1 << 16;
+    const gpud::Kernel &k = dev.compile(vulkan_saxpy);
+    gpud::Buffer a = dev.alloc(N * sizeof(float));
+    gpud::Buffer b = dev.alloc(N * sizeof(float));
+    gpud::Buffer o = dev.alloc(N * sizeof(float));
+    SaxpyScalars sc{2.0f, N};
+    gpud::Buffer *buffers[] = {&o, &a, &b};
+    const std::uint64_t before = dev.submitted().value;
+    for (int i = 0; i < 8; ++i) dev.run(k, (N + 63) / 64, blob_of(sc), buffers);
+    dev.flush();
+    dev.run(k, 1, blob_of(sc), buffers);   // reclaim runs at the next run()
+    dev.flush();
+
+    std::array<gpud::Device::BatchTiming, 8> got{};
+    const std::size_t n = dev.take_timings(got);
+    ASSERT_GE(n, std::size_t(2)) << "two full batches must report";
+    EXPECT_EQ(got[0].first.value, before + 1);
+    EXPECT_EQ(got[0].last.value, before + 4);
+    EXPECT_EQ(got[0].dispatches, 4u);
+    EXPECT_EQ(got[1].first.value, before + 5);
+    EXPECT_EQ(got[1].last.value, before + 8);
+    EXPECT_EQ(got[1].dispatches, 4u);
+    for (std::size_t i = 0; i < n; ++i) {
+        EXPECT_GT(got[i].gpu_end_ns, got[i].gpu_begin_ns)
+            << "batch " << i << " must end after it began";
+        EXPECT_LT(got[i].gpu_end_ns - got[i].gpu_begin_ns, 1000000000ull)
+            << "batch " << i << " lasted over a second";
+    }
+    EXPECT_GE(got[1].gpu_begin_ns, got[0].gpu_begin_ns)
+        << "the second batch must not begin before the first";
+    EXPECT_EQ(dev.take_timings(got), std::size_t(0))
+        << "a timing is handed out once";
+}
+
+} // namespace
+
+// Options::profile: every batch reports its tickets and a begin/end
+// pair on the device clock, drained once through take_timings.
+TEST(VulkanProfile, BatchTimingsArriveInOrderAndCoverTheDispatches) {
+    auto dev = gpud::vulkan::try_open(gpud::Options{.batch = 4, .profile = true});
+    if (!dev) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+    expect_two_batch_timings(*dev);
+}
+
+// GPUD_PROFILE=1 overrides the field, and off by default means EMPTY.
+TEST(VulkanProfile, EnvironmentOverridesTheFieldAndOffMeansEmpty) {
+    {
+        auto plain = gpud::vulkan::try_open(gpud::Options{.batch = 4});
+        if (!plain) GTEST_SKIP() << "vulkan: try_open returned nullptr";
+        constexpr std::uint32_t N = 256;
+        const gpud::Kernel &k = plain->compile(vulkan_saxpy);
+        gpud::Buffer a = plain->alloc(N * 4), b = plain->alloc(N * 4),
+                     o = plain->alloc(N * 4);
+        SaxpyScalars sc{2.0f, N};
+        gpud::Buffer *buffers[] = {&o, &a, &b};
+        for (int i = 0; i < 8; ++i) plain->run(k, 4, blob_of(sc), buffers);
+        plain->flush();
+        std::array<gpud::Device::BatchTiming, 4> got{};
+        EXPECT_EQ(plain->take_timings(got), std::size_t(0))
+            << "profiling is opt-in";
+    }
+#ifdef _WIN32
+    _putenv_s("GPUD_PROFILE", "1");
+#else
+    setenv("GPUD_PROFILE", "1", 1);
+#endif
+    auto dev = gpud::vulkan::try_open(gpud::Options{.batch = 4});
+#ifdef _WIN32
+    _putenv_s("GPUD_PROFILE", "");
+#else
+    unsetenv("GPUD_PROFILE");
+#endif
+    ASSERT_NE(dev, nullptr);
+    expect_two_batch_timings(*dev);
+}
+
 // Teardown cannot throw: past the bound it prints the sentence and
 // exits, because nothing it owns can be destroyed while the device may
 // still be using it. A threadsafe death test re-runs this binary, so the

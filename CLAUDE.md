@@ -65,7 +65,15 @@ cuda/metal remain scaffolding stubs (try_open returns nullptr).
   submitted, the two things it can mean — and teardown prints it and
   exits, since a destructor cannot throw and nothing it owns can be
   freed under a device that may still be using it. A lost device
-  throws its own sentence from check().
+  throws its own sentence from check(). Options::profile (GPUD_PROFILE=1
+  wins) stamps every batch begin/end on the device clock and labels it
+  "gpud batch"; take_timings() drains BatchTiming records (tickets,
+  dispatches, ns) once each and joins the carve-out. Stamps are read in
+  batch order and never waited for — MoltenVK publishes them from the
+  completion handler, AFTER the semaphore — so an unpublished one waits
+  for the next reclaim. Names ("gpud compute queue", "gpud timeline")
+  whenever the instance enabled VK_EXT_debug_utils; the owned instance
+  enables it when available.
 - **Fresh allocations are unspecified.** alloc() may hand back memory a
   destroyed Buffer owned, so its contents are undefined — write before
   reading. Conversely a Buffer may be destroyed while work using it is

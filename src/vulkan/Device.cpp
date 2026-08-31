@@ -47,17 +47,51 @@ std::unique_ptr<::gpud::Device> open_common(Device::State &s,
     if (const char *env = std::getenv("GPUD_WAIT_MS"); env && *env)
         wait_ms = std::strtoull(env, nullptr, 10);
     s.wait_ns = wait_ms * 1000000ull;
+    bool profile = opts.profile;
+    if (const char *env = std::getenv("GPUD_PROFILE"); env && *env == '1')
+        profile = true;
     const auto common_fail =
         [&](const char *why) -> std::unique_ptr<::gpud::Device> {
         log(why);
         if (s.timeline) vkDestroySemaphore(s.device, s.timeline, nullptr);
         if (s.pool) vkDestroyCommandPool(s.device, s.pool, nullptr);
+        if (s.timestamps) vkDestroyQueryPool(s.device, s.timestamps, nullptr);
         if (s.owned) {
             vkDestroyDevice(s.device, nullptr);
             vkDestroyInstance(s.instance, nullptr);
         }
         return nullptr;
     };
+
+    // Profiling wants a queue family that timestamps; the pool holds a
+    // begin/end pair per batch slot, and a batch's slot is free again
+    // before the ring comes round because pending batches are bounded
+    // by max_queued (one dispatch per batch at the least) plus the open
+    // one. Silently off otherwise — a profile is a request, not a
+    // requirement.
+    if (profile) {
+        std::uint32_t n = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(n);
+        vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &n, fams.data());
+        VkPhysicalDeviceProperties props;
+        vkGetPhysicalDeviceProperties(s.phys, &props);
+        if (s.queue_family < n && fams[s.queue_family].timestampValidBits) {
+            s.timestamp_slots = s.max_queued + 2;
+            VkQueryPoolCreateInfo qci{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = 2 * s.timestamp_slots;
+            if (vkCreateQueryPool(s.device, &qci, nullptr, &s.timestamps) ==
+                VK_SUCCESS) {
+                s.profile = true;
+                s.ns_per_tick = props.limits.timestampPeriod;
+            } else {
+                log("profile requested but vkCreateQueryPool failed");
+            }
+        } else {
+            log("profile requested but the queue family has no timestamps");
+        }
+    }
 
     // The command pool batches are recorded into (allocated lazily and
     // recycled — see begin_batch_locked) plus the timeline semaphore
@@ -111,6 +145,26 @@ std::unique_ptr<::gpud::Device> open_common(Device::State &s,
     if (vmaCreateAllocator(&aci, &s.allocator) != VK_SUCCESS)
         return common_fail("vmaCreateAllocator failed");
 
+    // Names, so a capture or a validation message says "gpud timeline"
+    // rather than a handle. The entry point exists only when the
+    // instance enabled VK_EXT_debug_utils (ours when available; an
+    // adopted one is the app's choice).
+    if (vkSetDebugUtilsObjectNameEXT) {
+        const auto name = [&](VkObjectType type, std::uint64_t handle,
+                              const char *text) {
+            VkDebugUtilsObjectNameInfoEXT ni{
+                VK_STRUCTURE_TYPE_DEBUG_UTILS_OBJECT_NAME_INFO_EXT};
+            ni.objectType = type;
+            ni.objectHandle = handle;
+            ni.pObjectName = text;
+            vkSetDebugUtilsObjectNameEXT(s.device, &ni);
+        };
+        name(VK_OBJECT_TYPE_QUEUE, reinterpret_cast<std::uint64_t>(s.queue),
+             "gpud compute queue");
+        name(VK_OBJECT_TYPE_SEMAPHORE,
+             reinterpret_cast<std::uint64_t>(s.timeline), "gpud timeline");
+    }
+
     return std::make_unique<Device>(s);
 }
 
@@ -137,6 +191,9 @@ std::unique_ptr<::gpud::Device> try_open(const Options &opts) {
         inst_exts.push_back("VK_KHR_portability_enumeration");
         flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
     }
+    // Object names and batch labels, for whatever captures this device.
+    if (has_extension(inst_ext_props, "VK_EXT_debug_utils"))
+        inst_exts.push_back("VK_EXT_debug_utils");
 
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "gpud";
@@ -327,6 +384,7 @@ Device::~Device() {
     // (It asserts if any allocation is still live, which is a free check
     // that the two really emptied out.)
     vmaDestroyAllocator(s.allocator);
+    if (s.timestamps) vkDestroyQueryPool(s.device, s.timestamps, nullptr);
     vkDestroySemaphore(s.device, s.timeline, nullptr);
     // Frees every command buffer allocated from it, batch_ included.
     vkDestroyCommandPool(s.device, s.pool, nullptr);
@@ -402,6 +460,16 @@ std::string device_lost_sentence(const char *what) {
            "validation names the kernel, Metal's debug layer the object";
 }
 
+std::size_t Device::take_timings(std::span<BatchTiming> out) {
+    std::lock_guard lock(m_);
+    std::size_t n = 0;
+    while (n < out.size() && !timings_.empty()) {
+        out[n++] = timings_.front();
+        timings_.pop_front();
+    }
+    return n;
+}
+
 void Device::submit() {
     // The open batch goes to the queue and its last ticket will be
     // signalled — the non-blocking half of flush(), for waiters that
@@ -466,10 +534,37 @@ void Device::reclaim_locked(bool force) {
         deferred_.pop_front();
         run_deferred_locked(d, force);
     }
+    // Stamps are read in batch order, never waited for: the first one
+    // the driver has not published yet stops the pass, and the rest
+    // wait behind it for the next reclaim.
+    if (!force)
+        while (!unread_.empty() && collect_timing_locked(unread_.front()))
+            unread_.pop_front();
     while (!pending_.empty() && (force || pending_.front().ticket <= done)) {
+        if (!force && pending_.front().slot != UINT32_MAX &&
+            (!unread_.empty() || !collect_timing_locked(pending_.front())))
+            unread_.push_back(pending_.front());
         free_.push_back(pending_.front().cmd);
         pending_.pop_front();
     }
+}
+
+bool Device::collect_timing_locked(const InFlight &b) {
+    if (b.slot == UINT32_MAX) return true;
+    std::uint64_t ticks[2] = {0, 0};
+    const VkResult r = vkGetQueryPoolResults(
+        s.device, s.timestamps, 2 * b.slot, 2, sizeof ticks, ticks,
+        sizeof ticks[0], VK_QUERY_RESULT_64_BIT);
+    if (r == VK_NOT_READY) return false;
+    if (r != VK_SUCCESS) return true;   // lost, not retried
+    const auto ns = [&](std::uint64_t t) {
+        return std::uint64_t(double(t) * double(s.ns_per_tick));
+    };
+    // Bounded backlog: nobody draining means the oldest go, not memory.
+    if (timings_.size() >= 4096) timings_.pop_front();
+    timings_.push_back({{b.first}, {b.ticket}, b.dispatches, ns(ticks[0]),
+                        ns(ticks[1])});
+    return true;
 }
 
 VkCommandBuffer Device::begin_batch_locked() {
@@ -495,6 +590,30 @@ VkCommandBuffer Device::begin_batch_locked() {
     check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
     free_.pop_back();
     batch_ = cmd;
+    batch_first_ = submitted_.load(std::memory_order_relaxed) + 1;
+
+    // Profiling: this batch's slot, reset in-stream, and its begin
+    // stamp — BOTTOM_OF_PIPE, the moment everything before it drained,
+    // which is the same convention the end stamp uses.
+    batch_slot_ = UINT32_MAX;
+    if (s.profile) {
+        batch_slot_ = next_slot_++ % s.timestamp_slots;
+        // The ring came round to a stamp still unpublished: that
+        // batch's timing is lost rather than read from a reset slot.
+        for (auto it = unread_.begin(); it != unread_.end(); ++it)
+            if (it->slot == batch_slot_) {
+                unread_.erase(it);
+                break;
+            }
+        vkCmdResetQueryPool(cmd, s.timestamps, 2 * batch_slot_, 2);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            s.timestamps, 2 * batch_slot_);
+        if (vkCmdBeginDebugUtilsLabelEXT) {
+            VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+            label.pLabelName = "gpud batch";
+            vkCmdBeginDebugUtilsLabelEXT(cmd, &label);
+        }
+    }
     return cmd;
 }
 
@@ -517,6 +636,11 @@ void Device::submit_batch_locked() {
     vkCmdPipelineBarrier(batch_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                          VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, nullptr, 0,
                          nullptr);
+    if (batch_slot_ != UINT32_MAX) {
+        if (vkCmdEndDebugUtilsLabelEXT) vkCmdEndDebugUtilsLabelEXT(batch_);
+        vkCmdWriteTimestamp(batch_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            s.timestamps, 2 * batch_slot_ + 1);
+    }
 
     VkResult r = vkEndCommandBuffer(batch_);
     if (r == VK_SUCCESS) {
@@ -535,7 +659,8 @@ void Device::submit_batch_locked() {
         q_unlock();
     }
 
-    pending_.push_back({ticket, batch_});
+    pending_.push_back({ticket, batch_, batch_first_, batch_count_,
+                        batch_slot_});
     batch_ = VK_NULL_HANDLE;
     batch_count_ = 0;
     last_submitted_ = ticket;

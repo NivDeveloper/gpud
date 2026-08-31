@@ -31,8 +31,8 @@
 //
 //  3. External synchronization, with one carve-out. Calls on one Device
 //     must be externally synchronized — except submitted(), completed(),
-//     wait() and submit(), which are safe to call from another thread
-//     while one is inside a Device call. Observing the timeline from elsewhere is
+//     wait(), submit() and take_timings(), which are safe to call from
+//     another thread while one is inside a Device call. Observing the timeline from elsewhere is
 //     the entire point of exposing it, so it would be useless otherwise.
 //     Distinct Devices are independent.
 //
@@ -113,6 +113,16 @@ struct Options {
     // a test run can bound a program that never set it); a program
     // whose dispatches legitimately run long leaves it 0.
     std::uint32_t wait_ms = 0;
+
+    // Profile the device timeline: every batch a backend submits gets a
+    // debug label (what a capture or a validation message names) and a
+    // timestamp pair on the device clock, drained through
+    // Device::take_timings. Off by default — a timestamp pair per batch
+    // is cheap, but nothing runs that nobody asked for; the environment
+    // variable GPUD_PROFILE=1 overrides this field, so a tracing build
+    // profiles a program that never set it. Silently off where the
+    // queue cannot timestamp (GPUD_LOG=1 says so).
+    bool profile = false;
 };
 
 // Move-only RAII handle to a device allocation. Backends subclass Impl;
@@ -267,6 +277,29 @@ class Device {
     // it is exactly wait(submitted()), and a backend that got those two
     // right cannot get this wrong.
     void flush() { wait(submitted()); }
+
+    // ── profiling (Options::profile) ─────────────────────────────────
+    // One completed batch: the tickets it carried, and when the device
+    // began and finished it, in NANOSECONDS on the device clock — the
+    // same clock any timestamp written on the same device reads, so a
+    // renderer's own sections and these batches sit on one timeline.
+    // The clock's zero is arbitrary; only differences and ordering mean
+    // anything.
+    struct BatchTiming {
+        Ticket first, last;
+        std::uint32_t dispatches;
+        std::uint64_t gpu_begin_ns, gpu_end_ns;
+    };
+
+    // Move up to out.size() completed batch timings into `out`, oldest
+    // first, and return how many; each is handed out ONCE. Part of the
+    // thread-safe carve-out (note 3): a renderer drains this on its own
+    // thread while the producer dispatches. A backend keeps a bounded
+    // backlog and drops the oldest when nobody drains. Empty unless
+    // profiling is on.
+    virtual std::size_t take_timings(std::span<BatchTiming> /*out*/) {
+        return 0;
+    }
 
   protected:
     virtual Kernel do_compile(std::string_view source) = 0;
